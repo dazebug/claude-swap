@@ -975,63 +975,80 @@ class AutoSwitchEngine:
         active_headroom = headroom.get(current)
         # Resolved in the gate below, read again at ranking time. Hoisted so
         # the ranking bypass sees it on every path through the gate.
-        drain_num: str | None = None
+        # Asked BEFORE the active account is classified, and deliberately so.
+        # A spend order is a statement about where quota should be consumed,
+        # not a reaction to how the stand-in happens to be doing. Consulted
+        # only in the below-threshold branch, it was ignored on the one tick
+        # that matters most -- the drain account resetting while the overflow
+        # account crosses the threshold -- and ordinary ranking sent the user
+        # to whichever peer had the most headroom instead. That detour also
+        # stamps a fresh cooldown, so the return they actually asked for was
+        # pushed out by another `cooldownSeconds` on top of the wasted hop.
+        drain_num = self._drain_account_target(
+            settings, headroom, quarantined, current
+        )
+        # `at-limit` skips the cooldown by design: sitting still on a spent
+        # account is never the right answer. A drain-return fired from that
+        # same state is the same move under a different name, so it must keep
+        # the bypass -- otherwise the fix above trades an extra hop for being
+        # stranded on a 100% account until the cooldown lapses. Tracked
+        # separately from the trigger because the trigger now says where we
+        # are going, while this says whether staying was ever an option.
+        # (`failover` needs no entry here: it keeps its own trigger name and
+        # was never in the cooldown tuple.)
+        must_move = active_headroom is not None and active_headroom <= 0
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                drain_num = self._drain_account_target(
-                    settings, headroom, quarantined, current
+            if drain_num is not None:
+                # The drain account's window is back under the threshold,
+                # so resume spending it. `drainAccount` is a spend-order
+                # rule: it names the account to burn first and makes every
+                # other one overflow. That is the same question
+                # `consume-first` answers, with a different anchor (a name
+                # the user chose, rather than the soonest weekly reset) --
+                # which is exactly why the two cannot both be live. A spend
+                # order has ONE anchor; the user's wins, and
+                # `_at_drain_account` enforces it.
+                trigger = "drain-return"
+            elif utilization >= settings.threshold:
+                trigger = "at-limit" if must_move else "proactive"
+            elif settings.strategy != "consume-first":
+                self._emit(
+                    NoSwitchEvent(
+                        reason="below-threshold",
+                        # Both sides through pct_label: .0f utilization could
+                        # display an impossible "100% < 99.9%".
+                        detail=(
+                            f"{pct_label(utilization)}% < "
+                            f"{pct_label(settings.threshold)}%"
+                        ),
+                    )
                 )
-                if drain_num is not None:
-                    # The drain account's window is back under the threshold,
-                    # so resume spending it. `drainAccount` is a spend-order
-                    # rule: it names the account to burn first and makes every
-                    # other one overflow. That is the same question
-                    # `consume-first` answers, with a different anchor (a name
-                    # the user chose, rather than the soonest weekly reset) --
-                    # which is exactly why the two cannot both be live. A spend
-                    # order has ONE anchor; the user's wins, and
-                    # `_at_drain_account` enforces it.
-                    trigger = "drain-return"
-                elif settings.strategy != "consume-first":
-                    self._emit(
-                        NoSwitchEvent(
-                            reason="below-threshold",
-                            # Both sides through pct_label: .0f utilization could
-                            # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
-                            ),
-                        )
+                return TickOutcome.NO_ACTION
+            elif self._at_drain_account(settings, current):
+                # Placed HERE, after the strategy check, so every other
+                # strategy keeps emitting today's below-threshold event
+                # verbatim: consume-first is the only one that can reach a
+                # move from this state, so it is the only one that needs
+                # intercepting (see `_at_drain_account` for the cycle).
+                self._emit(
+                    NoSwitchEvent(
+                        reason="drain-preferred",
+                        detail=(
+                            "staying on the configured drain account "
+                            "while it is under the threshold"
+                        ),
                     )
-                    return TickOutcome.NO_ACTION
-                elif self._at_drain_account(settings, current):
-                    # Placed HERE, after the strategy check, so every other
-                    # strategy keeps emitting today's below-threshold event
-                    # verbatim: consume-first is the only one that can reach a
-                    # move from this state, so it is the only one that needs
-                    # intercepting (see `_at_drain_account` for the cycle).
-                    self._emit(
-                        NoSwitchEvent(
-                            reason="drain-preferred",
-                            detail=(
-                                "staying on the configured drain account "
-                                "while it is under the threshold"
-                            ),
-                        )
-                    )
-                    return TickOutcome.NO_ACTION
-                else:
-                    # consume-first: below the threshold we still proactively move
-                    # to whichever account's weekly window resets soonest, to burn
-                    # the most-perishable quota first. Candidate selection decides
-                    # whether a sooner-resetting account with room actually exists.
-                    trigger = "consume-first"
+                )
+                return TickOutcome.NO_ACTION
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                # consume-first: below the threshold we still proactively move
+                # to whichever account's weekly window resets soonest, to burn
+                # the most-perishable quota first. Candidate selection decides
+                # whether a sooner-resetting account with room actually exists.
+                trigger = "consume-first"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1081,7 +1098,8 @@ class AutoSwitchEngine:
             trigger = "failover"
 
         if (
-            trigger in ("proactive", "consume-first", "drain-return")
+            (trigger in ("proactive", "consume-first")
+             or (trigger == "drain-return" and not must_move))
             and self._in_cooldown(state)
         ):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1211,7 +1229,7 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        if trigger == "drain-return":
+        if drain_num is not None and trigger in ("drain-return", "failover"):
             # A NAMED target, not a ranked one — skip `_rank` entirely so
             # neither the hysteresis margin nor the no-return bar can veto it.
             # Both of those answer "is this a BETTER account?"; drain-return
@@ -1220,6 +1238,16 @@ class AutoSwitchEngine:
             # the user on an away account that merely has more headroom — the
             # normal case right after a reset, and the whole point of naming
             # an account in the first place.
+            #
+            # `failover` rides this too, but keeps its own trigger name: the
+            # trigger records WHY we moved (the active account went
+            # unreadable), not where we landed. Relabelling it would rewrite
+            # `leftTrigger` in the state, and `_no_return_account` reads that
+            # to choose the more permissive release legs a failover departure
+            # is owed -- an ordinary-departure classification there would sit
+            # on a `leftHeadroom` of None that was never measured. The
+            # debounce is untouched for the same reason it exists: one
+            # unreadable tick must not move anyone.
             ordered, any_known, active_reset_ts = [drain_num], True, None
         else:
             ordered, any_known, active_reset_ts = _rank(
@@ -1409,7 +1437,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, must_move)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1440,7 +1468,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, must_move)
 
         if systemic or transient_failure:
             self._emit(
@@ -2300,6 +2328,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        must_move: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2323,7 +2352,8 @@ class AutoSwitchEngine:
         with self._state_lock():
             state = self._read_state()
             if (
-                trigger in ("proactive", "consume-first", "drain-return")
+                (trigger in ("proactive", "consume-first")
+                 or (trigger == "drain-return" and not must_move))
                 and self._in_cooldown(state)
             ):
                 self._emit(NoSwitchEvent(reason="cooldown"))

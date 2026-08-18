@@ -7394,3 +7394,124 @@ class TestDrainReturnHonoursTheModelWindow:
 
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestDrainReturnOutranksTheOverflowAccountsState:
+    """The return must not depend on how the account we are ON is doing.
+
+    `_drain_account_target` was consulted only inside the below-threshold
+    branch, so a tick where the drain account recovers AND the overflow
+    account crosses the threshold fell through to ordinary ranking. That is
+    the one tick where the setting matters most, and it is exactly when it
+    was ignored.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="1", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_recovered_drain_account_beats_a_roomier_third_account(self, temp_home):
+        """Overflow hits the threshold the same tick the drain account resets.
+
+        Ranking would send us to the roomiest peer, adding a hop the user did
+        not ask for — and that hop records a cooldown, so the return they DID
+        ask for is delayed by another `cooldownSeconds` on top.
+        """
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),   # drain account spent -> leave
+            "2": _usage7(10, 10),   # roomiest -> lands here
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),   # drain account recovered
+            "2": _usage7(95, 20),   # where we are, now over the threshold
+            "3": _usage7(0, 0),     # roomier than the drain account
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            "went to the roomiest peer instead of the account the user named; "
+            "the drain order should not be contingent on how the overflow "
+            "account happens to be doing"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "drain-return"
+
+    def test_an_exhausted_overflow_still_escapes_during_the_cooldown(self, temp_home):
+        """Making the return outrank `at-limit` must not re-gate the escape.
+
+        `at-limit` bypasses the cooldown by design — sitting still on a spent
+        account is never right. Routing that tick through drain-return must
+        keep the bypass, or the fix trades an extra hop for being stranded.
+        """
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(5)  # still well inside the default 300s cooldown
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),    # drain account recovered
+            "2": _usage7(100, 100),  # where we are, fully exhausted
+            "3": _usage7(0, 0),
+        })
+
+        assert outcome is TickOutcome.SWITCHED, (
+            "held on a 100% account because the cooldown was applied to a "
+            "move that had to happen"
+        )
+        assert h.active_number() == 1
+
+
+    def test_a_failover_move_also_lands_on_the_drain_account(self, temp_home):
+        """Failover picks a target too, and that target is a spend-order call.
+
+        The debounce is untouched — a single unreadable tick must not move
+        anyone. But once failover has decided to move, ranking used to send us
+        to whichever peer was roomiest: measured, drain #1 recovered at 20%
+        and the engine went to #3 at 0% instead, leaving the user off the
+        account they named until some later tick happened to bring them back.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),   # drain account recovered
+            "2": None,              # where we are — unreadable, so failover
+            "3": _usage7(0, 0),     # roomier than the drain account
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover", (
+            "the trigger records WHY we moved, not where we landed; "
+            "relabelling it would rewrite `leftTrigger` and mislead the "
+            "anti-flap release legs that a failover departure is owed"
+        )
