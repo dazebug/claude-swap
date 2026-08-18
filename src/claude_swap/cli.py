@@ -642,7 +642,7 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
-        "--home",
+        "--drain-account",
         metavar="ACCOUNT",
         help=(
             "Spend this account first (alias, slot number, or email). The others "

@@ -48,7 +48,7 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
-            "autoswitch.home",
+            "autoswitch.drainAccount",
             "ui.theme",
         ):
             assert key in out
@@ -80,8 +80,8 @@ class TestConfigList:
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
         assert len(by_key) == 10
-        assert by_key["autoswitch.home"]["value"] is None
-        assert by_key["autoswitch.home"]["isSet"] is False
+        assert by_key["autoswitch.drainAccount"]["value"] is None
+        assert by_key["autoswitch.drainAccount"]["isSet"] is False
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False

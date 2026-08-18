@@ -6896,8 +6896,8 @@ class TestFreshenRoutesThroughGate:
 
 
 
-class TestHomeAccount:
-    """`autoswitch.home` — a user-named account the engine returns to.
+class TestDrainAccount:
+    """`autoswitch.drainAccount` — a user-named account the engine returns to.
 
     The engine already leaves an account that hits the threshold. What it has
     never done is come BACK: the tick gate returns NO_ACTION for every
@@ -6917,7 +6917,7 @@ class TestHomeAccount:
         h.make_live("a@example.com", 1)
         return h
 
-    def _leave_home(self, h: EngineHarness) -> None:
+    def _leave_the_drain_account(self, h: EngineHarness) -> None:
         """Burn home past the threshold so the ENGINE moves off it itself.
 
         Going through a real departure is the point: it arms `lastSwitchTo`
@@ -6934,10 +6934,10 @@ class TestHomeAccount:
         h.clock.advance(400)  # clear the proactive cooldown (default 300s)
         h.events.clear()
 
-    def test_returns_home_once_home_is_back_under_the_threshold(self, temp_home):
+    def test_returns_once_the_drain_account_is_back_under_the_threshold(self, temp_home):
         """The whole feature: home's window reset, so go back to home."""
-        h = self._harness(temp_home, home="1")
-        self._leave_home(h)
+        h = self._harness(temp_home, drain_account="1")
+        self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
             "1": _usage7(10, 10),   # home recovered
@@ -6951,12 +6951,12 @@ class TestHomeAccount:
         )
         assert h.active_number() == 1
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "home-return"
+        assert sw.trigger == "drain-return"
 
-    def test_stays_away_while_home_is_still_over_the_threshold(self, temp_home):
+    def test_stays_away_while_the_drain_account_is_still_over_the_threshold(self, temp_home):
         """Not a magnet: home has to actually be usable before we go back."""
-        h = self._harness(temp_home, home="1")
-        self._leave_home(h)
+        h = self._harness(temp_home, drain_account="1")
+        self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
             "1": _usage7(95, 20),   # home still spent
@@ -6966,7 +6966,7 @@ class TestHomeAccount:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 2
 
-    def test_home_return_ignores_hysteresis(self, temp_home):
+    def test_drain_return_ignores_hysteresis(self, temp_home):
         """`hysteresis_pct` must not gate the return.
 
         Hysteresis exists to stop two accounts trading places while both
@@ -6975,8 +6975,8 @@ class TestHomeAccount:
         it here would strand the user on an away account that merely happens
         to have more headroom, which is the normal case after a return.
         """
-        h = self._harness(temp_home, home="1", hysteresis_pct=10.0)
-        self._leave_home(h)
+        h = self._harness(temp_home, drain_account="1", hysteresis_pct=10.0)
+        self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
             "1": _usage7(80, 20),   # home usable, but WORSE than away
@@ -6986,10 +6986,10 @@ class TestHomeAccount:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 1
 
-    def test_unset_home_leaves_todays_behaviour_untouched(self, temp_home):
+    def test_unset_drain_account_leaves_todays_behaviour_untouched(self, temp_home):
         """Regression guard: the default must change nothing."""
         h = self._harness(temp_home)  # home unset
-        self._leave_home(h)
+        self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
             "1": _usage7(10, 10),
@@ -7002,11 +7002,11 @@ class TestHomeAccount:
         assert reasons == ["below-threshold"]
 
 
-class TestHomeAccountWithMoreThanTwoAccounts:
+class TestDrainAccountWithMoreThanTwoAccounts:
     """Home is one account among many — the other axes must keep working.
 
     With exactly two accounts "leave home" and "go to the other one" are the
-    same decision, so a two-account suite cannot tell whether home-return
+    same decision, so a two-account suite cannot tell whether drain-return
     distorts target selection or merely adds a return leg.
     """
 
@@ -7018,13 +7018,13 @@ class TestHomeAccountWithMoreThanTwoAccounts:
         h.make_live("a@example.com", 1)
         return h
 
-    def test_departure_from_home_still_obeys_the_strategy(self, temp_home):
+    def test_departure_from_the_drain_account_still_obeys_the_strategy(self, temp_home):
         """Naming a home must not bias which account we LEAVE to.
 
         home answers "where do I return", not "where do I go next" — the
         strategy still owns departure, so the most-headroom peer wins.
         """
-        h = self._harness(temp_home, home="1")
+        h = self._harness(temp_home, drain_account="1")
 
         outcome = h.tick_with_usage({
             "1": _usage7(95, 20),   # home, spent -> must leave
@@ -7035,9 +7035,9 @@ class TestHomeAccountWithMoreThanTwoAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_returns_home_rather_than_to_the_roomiest_peer(self, temp_home):
+    def test_returns_to_the_drain_account_not_the_roomiest_peer(self, temp_home):
         """The return target is home, not whoever ranks best."""
-        h = self._harness(temp_home, home="1")
+        h = self._harness(temp_home, drain_account="1")
         assert h.tick_with_usage({
             "1": _usage7(95, 20),
             "2": _usage7(50, 50),
@@ -7056,15 +7056,15 @@ class TestHomeAccountWithMoreThanTwoAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 1
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "home-return"
+        assert sw.trigger == "drain-return"
 
-    def test_no_shuffling_between_peers_while_home_is_still_spent(self, temp_home):
+    def test_no_shuffling_between_peers_while_the_drain_account_is_spent(self, temp_home):
         """Below the threshold with home unusable, today's NO_ACTION stands.
 
         A home that cannot be returned to must not turn the gate into a
         general-purpose "move to the roomiest account" rule.
         """
-        h = self._harness(temp_home, home="1")
+        h = self._harness(temp_home, drain_account="1")
         assert h.tick_with_usage({
             "1": _usage7(95, 20),
             "2": _usage7(50, 50),
@@ -7086,8 +7086,8 @@ class TestHomeAccountWithMoreThanTwoAccounts:
         assert reasons == ["below-threshold"]
 
 
-class TestHomeReturnFreshnessAndKind:
-    """The two ways a naive home-return lands somewhere it should not."""
+class TestDrainReturnFreshnessAndKind:
+    """The two ways a naive drain-return lands somewhere it should not."""
 
     def _harness(self, temp_home: Path, **kw) -> EngineHarness:
         h = EngineHarness(temp_home, threshold=90.0, **kw)
@@ -7116,19 +7116,19 @@ class TestHomeReturnFreshnessAndKind:
             outcome = h.engine.tick()
         return outcome, fetch_sets
 
-    def test_a_stale_home_snapshot_does_not_trigger_a_doomed_return(self, temp_home):
+    def test_a_stale_drain_account_snapshot_does_not_trigger_a_doomed_return(self, temp_home):
         """Home is a CANDIDATE, so its snapshot can be minutes old.
 
-        `_home_return_target` argues home-return cannot flap because home's
+        `_drain_account_target` argues drain-return cannot flap because home's
         utilization only falls on a window reset. That holds for the TRUE
         value; it does not hold for a stale one. Home can be burned from
         another machine or a `cswap run` terminal while we are away, and a
         stale-low reading would send us back to a spent home and straight out
         again on the next tick — the one way the no-flap argument is
         defeated. consume-first already re-decides on fresh data before
-        committing a below-threshold move; home-return has the same exposure.
+        committing a below-threshold move; drain-return has the same exposure.
         """
-        h = self._harness(temp_home, home="2")
+        h = self._harness(temp_home, drain_account="2")
         stored = {
             "1": _usage7(20, 20),
             "2": _usage7(10, 10),    # home looks recovered...
@@ -7150,9 +7150,9 @@ class TestHomeReturnFreshnessAndKind:
         assert h.active_number() == 1
         assert {"1", "2", "3"} in fetch_sets, "phase-2 refetch never happened"
 
-    def test_a_fresh_confirmation_still_returns_home(self, temp_home):
+    def test_a_fresh_confirmation_still_returns(self, temp_home):
         """The refetch is a check, not a veto: agreeing data still switches."""
-        h = self._harness(temp_home, home="2")
+        h = self._harness(temp_home, drain_account="2")
         view = {
             "1": _usage7(20, 20),
             "2": _usage7(10, 10),
@@ -7165,16 +7165,16 @@ class TestHomeReturnFreshnessAndKind:
         assert h.active_number() == 2
         assert {"1", "2", "3"} in fetch_sets
 
-    def test_an_api_key_home_is_never_returned_to(self, temp_home):
+    def test_an_api_key_drain_account_is_never_returned_to(self, temp_home):
         """`include_api_key_accounts` must gate home like every other target.
 
         The ranking path splits OAuth from API-key candidates and keeps the
-        metered ones as a last resort; home-return skips `_rank` entirely, so
+        metered ones as a last resort; drain-return skips `_rank` entirely, so
         it has to carry that rule itself. Relying on API-key accounts merely
         happening to report unreadable headroom leaves the invariant to an
         accident somewhere else in the codebase.
         """
-        h = self._harness(temp_home, home="2")
+        h = self._harness(temp_home, drain_account="2")
         data = h.switcher._get_sequence_data()
         data["accounts"]["2"]["kind"] = "api_key"
         h.switcher._write_json(h.switcher.sequence_file, data)
@@ -7189,17 +7189,17 @@ class TestHomeReturnFreshnessAndKind:
         assert h.active_number() == 1
 
 
-class TestHomeWithConsumeFirst:
+class TestDrainAccountWithConsumeFirst:
     """`home` + `consume-first`: two proactive below-threshold triggers.
 
-    home-return was written as orthogonal to `strategy`, but consume-first is
+    drain-return was written as orthogonal to `strategy`, but consume-first is
     the one strategy that also moves BELOW the threshold. Its departure rule
-    (go to the soonest weekly reset) and home-return's return rule (go to
+    (go to the soonest weekly reset) and drain-return's return rule (go to
     home) are not disjoint, so the pair can cycle forever on data that never
     changes.
     """
 
-    def test_consume_first_does_not_drag_us_off_a_healthy_home(self, temp_home):
+    def test_consume_first_does_not_drag_us_off_a_healthy_drain_account(self, temp_home):
         """Fixed snapshot, one cooldown apart: the active account must settle.
 
         home #1 resets LAST, so consume-first always wants to leave it; home
@@ -7208,7 +7208,7 @@ class TestHomeWithConsumeFirst:
         third account keeps the cycle supplied with a fresh target.
         """
         h = EngineHarness(
-            temp_home, threshold=90.0, home="1", strategy="consume-first"
+            temp_home, threshold=90.0, drain_account="1", strategy="consume-first"
         )
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
@@ -7243,7 +7243,7 @@ class TestHomeWithConsumeFirst:
         `below-threshold`, not a new reason -- an event rename is a behaviour
         change for anyone parsing `cswap auto --json`.
         """
-        h = EngineHarness(temp_home, threshold=90.0, home="1", strategy="best")
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="1", strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -7256,8 +7256,8 @@ class TestHomeWithConsumeFirst:
         assert reasons == ["below-threshold"]
 
 
-class TestHomeReturnRefusesWhatItCannotTrust:
-    """Every way `autoswitch.home` can name something unusable.
+class TestDrainReturnRefusesWhatItCannotTrust:
+    """Every way `autoswitch.drainAccount` can name something unusable.
 
     Each one must fall through to today's below-threshold behaviour rather
     than switch — the setting is a preference, not an override of the checks
@@ -7274,9 +7274,9 @@ class TestHomeReturnRefusesWhatItCannotTrust:
     def _healthy(self) -> dict:
         return {"1": _usage7(20, 20), "2": _usage7(10, 10)}
 
-    def test_a_quarantined_home_is_not_returned_to(self, temp_home):
+    def test_a_quarantined_drain_account_is_not_returned_to(self, temp_home):
         """A dead refresh token makes home unusable however preferred it is."""
-        h = self._harness(temp_home, home="2")
+        h = self._harness(temp_home, drain_account="2")
         h.engine._quarantine("2", "b@example.com", "identity-conflict")
 
         outcome = h.tick_with_usage(self._healthy())
@@ -7284,9 +7284,9 @@ class TestHomeReturnRefusesWhatItCannotTrust:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_a_disabled_home_is_not_returned_to(self, temp_home):
+    def test_a_disabled_drain_account_is_not_returned_to(self, temp_home):
         """`cswap disable` is newer and more specific than a home set earlier."""
-        h = self._harness(temp_home, home="2")
+        h = self._harness(temp_home, drain_account="2")
         data = h.switcher._get_sequence_data()
         data["accounts"]["2"]["disabled"] = True
         h.switcher._write_json(h.switcher.sequence_file, data)
@@ -7296,14 +7296,14 @@ class TestHomeReturnRefusesWhatItCannotTrust:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_an_ambiguous_home_email_never_guesses_a_slot(self, temp_home):
+    def test_an_ambiguous_drain_account_email_never_guesses_a_slot(self, temp_home):
         """Two slots, one email — resolution raises, and we must not pick one.
 
         This is the real shape for anyone with a personal and an org account
         under the same address: `cswap switch <email>` already refuses it, so
         silently choosing a slot here would be worse than doing nothing.
         """
-        h = EngineHarness(temp_home, threshold=90.0, home="dup@example.com")
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="dup@example.com")
         h.seed(1, "a@example.com")
         h.seed(2, "dup@example.com")
         h.seed(3, "dup@example.com")
@@ -7316,23 +7316,23 @@ class TestHomeReturnRefusesWhatItCannotTrust:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_an_unknown_home_name_is_inert(self, temp_home):
+    def test_an_unknown_drain_account_name_is_inert(self, temp_home):
         """A typo'd or removed account must not break the tick."""
-        h = self._harness(temp_home, home="nope@example.com")
+        h = self._harness(temp_home, drain_account="nope@example.com")
 
         outcome = h.tick_with_usage(self._healthy())
 
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_an_unreadable_home_holds_rather_than_guesses(self, temp_home):
+    def test_an_unreadable_drain_account_holds_rather_than_guesses(self, temp_home):
         """Unknown headroom is not 'probably fine'.
 
         Landing on an account whose usage we cannot read would re-trigger
         blind on the next tick — the same harm the landing gate in
         `_rank_candidates` exists to prevent.
         """
-        h = self._harness(temp_home, home="2")
+        h = self._harness(temp_home, drain_account="2")
 
         outcome = h.tick_with_usage({
             "1": _usage7(20, 20),
@@ -7343,7 +7343,7 @@ class TestHomeReturnRefusesWhatItCannotTrust:
         assert h.active_number() == 1
 
 
-class TestHomeReturnHonoursTheModelWindow:
+class TestDrainReturnHonoursTheModelWindow:
     """`autoswitch.model` must gate the return, not just the departure.
 
     Home reads its headroom from the same `_headroom_by_account` the rest of
@@ -7355,13 +7355,13 @@ class TestHomeReturnHonoursTheModelWindow:
     """
 
     def _harness(self, temp_home: Path, **kw) -> EngineHarness:
-        h = EngineHarness(temp_home, threshold=90.0, home="2", **kw)
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="2", **kw)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
         return h
 
-    def test_a_home_whose_model_window_is_spent_is_not_returned_to(self, temp_home):
+    def test_a_drain_account_whose_model_window_is_spent_is_not_returned_to(self, temp_home):
         h = self._harness(temp_home, model="Fable")
 
         outcome = h.tick_with_usage({
@@ -7376,12 +7376,12 @@ class TestHomeReturnHonoursTheModelWindow:
         )
         assert h.active_number() == 1
 
-    def test_the_same_home_is_returned_to_when_the_model_is_not_watched(
+    def test_the_same_account_is_returned_to_when_the_model_is_not_watched(
         self, temp_home
     ):
         """The differential: identical usage, `model` unset -> the return fires.
 
-        Without this pair the test above would also pass if home-return were
+        Without this pair the test above would also pass if drain-return were
         broken in some unrelated way, and it would not show that `model` is
         what made the difference.
         """

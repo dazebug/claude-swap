@@ -975,25 +975,26 @@ class AutoSwitchEngine:
         active_headroom = headroom.get(current)
         # Resolved in the gate below, read again at ranking time. Hoisted so
         # the ranking bypass sees it on every path through the gate.
-        home_num: str | None = None
+        drain_num: str | None = None
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                home_num = self._home_return_target(
+                drain_num = self._drain_account_target(
                     settings, headroom, quarantined, current
                 )
-                if home_num is not None:
-                    # Home's window is back under the threshold, so resume
-                    # spending it. `home` is a spend-order rule: it names the
-                    # account to burn first and makes every other one overflow.
-                    # That is the same question `consume-first` answers, with
-                    # a different anchor (a name the user chose, rather than
-                    # the soonest weekly reset) -- which is exactly why the two
-                    # cannot both be live. A spend order has ONE anchor; the
-                    # user's wins, and `_at_preferred_home` enforces it.
-                    trigger = "home-return"
+                if drain_num is not None:
+                    # The drain account's window is back under the threshold,
+                    # so resume spending it. `drainAccount` is a spend-order
+                    # rule: it names the account to burn first and makes every
+                    # other one overflow. That is the same question
+                    # `consume-first` answers, with a different anchor (a name
+                    # the user chose, rather than the soonest weekly reset) --
+                    # which is exactly why the two cannot both be live. A spend
+                    # order has ONE anchor; the user's wins, and
+                    # `_at_drain_account` enforces it.
+                    trigger = "drain-return"
                 elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1007,18 +1008,18 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                elif self._at_preferred_home(settings, current):
+                elif self._at_drain_account(settings, current):
                     # Placed HERE, after the strategy check, so every other
                     # strategy keeps emitting today's below-threshold event
                     # verbatim: consume-first is the only one that can reach a
                     # move from this state, so it is the only one that needs
-                    # intercepting (see `_at_preferred_home` for the cycle).
+                    # intercepting (see `_at_drain_account` for the cycle).
                     self._emit(
                         NoSwitchEvent(
-                            reason="home-preferred",
+                            reason="drain-preferred",
                             detail=(
-                                "staying on the configured home while it is "
-                                "under the threshold"
+                                "staying on the configured drain account "
+                                "while it is under the threshold"
                             ),
                         )
                     )
@@ -1080,7 +1081,7 @@ class AutoSwitchEngine:
             trigger = "failover"
 
         if (
-            trigger in ("proactive", "consume-first", "home-return")
+            trigger in ("proactive", "consume-first", "drain-return")
             and self._in_cooldown(state)
         ):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1210,16 +1211,16 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        if trigger == "home-return":
+        if trigger == "drain-return":
             # A NAMED target, not a ranked one — skip `_rank` entirely so
             # neither the hysteresis margin nor the no-return bar can veto it.
-            # Both of those answer "is this a BETTER account?"; home-return
-            # asks "is home usable yet?", which the gate already answered
+            # Both of those answer "is this a BETTER account?"; drain-return
+            # asks "is the drain account usable yet?", which the gate answered
             # against this same headroom snapshot. Ranking here would strand
             # the user on an away account that merely has more headroom — the
             # normal case right after a reset, and the whole point of naming
             # an account in the first place.
-            ordered, any_known, active_reset_ts = [home_num], True, None
+            ordered, any_known, active_reset_ts = [drain_num], True, None
         else:
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
@@ -1233,7 +1234,7 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if trigger in ("consume-first", "home-return") and ordered:
+        if trigger in ("consume-first", "drain-return") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1252,31 +1253,31 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            if trigger == "home-return":
-                # Re-ask the same question of the fresh data. Home is a
-                # CANDIDATE, so its stored snapshot can be up to
+            if trigger == "drain-return":
+                # Re-ask the same question of the fresh data. The drain
+                # account is a CANDIDATE, so its stored snapshot can be up to
                 # CANDIDATE_MAX_INTERVAL_S old, and a stale-LOW reading is
-                # exactly the case `_home_return_target`'s no-flap argument
-                # cannot cover: that argument is about home's true
-                # utilization, which only falls on a window reset, while a
-                # stale value can read low because home was burned from
-                # another machine or a `cswap run` terminal since. Returning
-                # on it would land on a spent home and leave again next tick.
-                home_num = self._home_return_target(
+                # exactly the case `_drain_account_target`'s no-flap argument
+                # cannot cover: that argument is about its TRUE utilization,
+                # which only falls on a window reset, while a stale value can
+                # read low because the account was burned from another machine
+                # or a `cswap run` terminal since. Returning on it would land
+                # on a spent account and leave again next tick.
+                drain_num = self._drain_account_target(
                     settings, headroom, quarantined, current
                 )
-                if home_num is None:
+                if drain_num is None:
                     self._emit(
                         NoSwitchEvent(
-                            reason="home-unavailable",
+                            reason="drain-unavailable",
                             detail=(
-                                "home is no longer under the threshold on "
-                                "fresh usage; staying put"
+                                "the drain account is no longer under the "
+                                "threshold on fresh usage; staying put"
                             ),
                         )
                     )
                     return TickOutcome.NO_ACTION
-                ordered = [home_num]
+                ordered = [drain_num]
             else:
                 ordered, any_known, active_reset_ts = _rank(
                     trigger=trigger,
@@ -1386,7 +1387,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger in ("consume-first", "home-return"):
+            if trigger in ("consume-first", "drain-return"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1454,34 +1455,34 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
-    def _resolved_home(self, settings: AutoSwitchSettings) -> str | None:
-        """``autoswitch.home`` as an account number, or None if not usable.
+    def _resolved_drain_account(self, settings: AutoSwitchSettings) -> str | None:
+        """``autoswitch.drainAccount`` as an account number, or None if not usable.
 
-        One definition shared by both home questions — "is home a target?"
-        (:meth:`_home_return_target`) and "are we ON home?"
-        (:meth:`_at_preferred_home`) — so the two can never disagree about
+        One definition shared by both questions the setting raises — "is it a
+        target?" (:meth:`_drain_account_target`) and "are we ON it?"
+        (:meth:`_at_drain_account`) — so the two can never disagree about
         which slot the setting names.
         """
-        if not settings.home:
+        if not settings.drain_account:
             return None
         try:
-            return self.switcher._resolve_account_identifier(settings.home)
+            return self.switcher._resolve_account_identifier(settings.drain_account)
         except ClaudeSwitchError:
             # Unresolvable or ambiguous (e.g. two slots sharing an email).
             # Never guess which slot the user meant — hold and let the
             # below-threshold path answer as it does today.
             return None
 
-    def _at_preferred_home(
+    def _at_drain_account(
         self, settings: AutoSwitchSettings, current: str
     ) -> bool:
-        """Are we sitting on a home that is still in rotation?
+        """Are we sitting on the drain account, and is it still in rotation?
 
         Used to suppress a proactive consume-first DEPARTURE, because a
         spend order can only have ONE anchor.
 
-        `home` and `consume-first` are not opposites, they are the same kind
-        of rule: both decide which account's quota gets burned first, and
+        `drainAccount` and `consume-first` are not opposites, they are the
+        same kind of rule: both decide whose quota burns first, and
         they differ only in who picks the anchor — a name the user gave, or
         the soonest weekly reset found in the data. Two anchors cannot both
         be live, and left alone they do not merely disagree once, they cycle
@@ -1497,34 +1498,34 @@ class AutoSwitchEngine:
         not. Departures at/above the threshold are untouched — those are not
         a spend-order question, they are the engine's whole point.
 
-        A DISABLED home is not preferred: `cswap disable` is the user's own
-        "hold this out of rotation", which is newer and more specific than a
-        home set earlier.
+        A DISABLED drain account does not win: `cswap disable` is the user's
+        own "hold this out of rotation", which is newer and more specific than
+        a drain account set earlier.
         """
-        num = self._resolved_home(settings)
+        num = self._resolved_drain_account(settings)
         return (
             num is not None
             and num == current
             and num in self.switcher.switchable_account_numbers()
         )
 
-    def _home_return_target(
+    def _drain_account_target(
         self,
         settings: AutoSwitchSettings,
         headroom: dict[str, float | None],
         quarantined: set[str],
         current: str,
     ) -> str | None:
-        """The home account, when it is both configured and usable again.
+        """The drain account, when it is both configured and usable again.
 
         Returns None unless every condition holds, so a caller that gets None
         falls through to today's below-threshold behaviour untouched:
 
-        - ``autoswitch.home`` resolves to a switchable, non-quarantined
-          account. A DISABLED home stays out on purpose:
+        - ``autoswitch.drainAccount`` resolves to a switchable, non-quarantined
+          account. A DISABLED one stays out on purpose:
           ``switchable_account_numbers`` already honours ``cswap disable``,
           and disabling is the user's own "leave this one alone" — it must
-          outrank a home set earlier and forgotten.
+          outrank a drain account set earlier and forgotten.
         - it is not where we already are.
         - its binding window is READABLE and under the threshold. Unknown
           headroom is not "probably fine": landing on an account we cannot
@@ -1533,7 +1534,7 @@ class AutoSwitchEngine:
 
         WHY RETURNING HERE DOES NOT FLAP, despite bypassing the anti-flap
         gates — and what that argument depends on. Returning fires only
-        strictly below the threshold, and home's utilization rises
+        strictly below the threshold, and its utilization rises
         monotonically while it is active and cannot fall while it is not, so
         the only thing that moves it back down is a window reset: the event
         this feature exists to catch. That is a different shape from the
@@ -1543,23 +1544,23 @@ class AutoSwitchEngine:
         The argument holds only while two things stay true elsewhere, and
         BOTH were violated by the first version of this feature:
 
-        - Departure from home must happen only at/above the threshold. It is
+        - Departure from it must happen only at/above the threshold. It is
           not intrinsic — ``consume-first`` departs BELOW it, on the
           unrelated axis of which weekly window resets soonest, and the pair
           cycled forever on unchanging data until
-          :meth:`_at_preferred_home` suppressed that departure. Any future
+          :meth:`_at_drain_account` suppressed that departure. Any future
           strategy that can leave a healthy account needs the same
           treatment or this predicate starts flapping again.
-        - The reading must be home's TRUE utilization. Home is a candidate,
-          so what the caller holds may be minutes old, and a stale-LOW value
-          (home burned from another machine or a ``cswap run`` terminal
+        - The reading must be its TRUE utilization. The drain account is a
+          candidate, so what the caller holds may be minutes old, and a
+          stale-LOW value (burned from another machine or a ``cswap run``
           since the snapshot) reads like a reset that never happened. The
           caller therefore re-runs this predicate against the phase-2
           refetch before committing.
 
         On its own this predicate is necessary, not sufficient.
         """
-        num = self._resolved_home(settings)
+        num = self._resolved_drain_account(settings)
         if num is None or num == current or num in quarantined:
             return None
         if num not in self.switcher.switchable_account_numbers():
@@ -2322,7 +2323,7 @@ class AutoSwitchEngine:
         with self._state_lock():
             state = self._read_state()
             if (
-                trigger in ("proactive", "consume-first", "home-return")
+                trigger in ("proactive", "consume-first", "drain-return")
                 and self._in_cooldown(state)
             ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
