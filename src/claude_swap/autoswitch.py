@@ -1005,6 +1005,22 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
+                elif self._at_preferred_home(settings, current):
+                    # Placed HERE, after the strategy check, so every other
+                    # strategy keeps emitting today's below-threshold event
+                    # verbatim: consume-first is the only one that can reach a
+                    # move from this state, so it is the only one that needs
+                    # intercepting (see `_at_preferred_home` for the cycle).
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="home-preferred",
+                            detail=(
+                                "staying on the configured home while it is "
+                                "under the threshold"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 else:
                     # consume-first: below the threshold we still proactively move
                     # to whichever account's weekly window resets soonest, to burn
@@ -1436,6 +1452,56 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    def _resolved_home(self, settings: AutoSwitchSettings) -> str | None:
+        """``autoswitch.home`` as an account number, or None if not usable.
+
+        One definition shared by both home questions — "is home a target?"
+        (:meth:`_home_return_target`) and "are we ON home?"
+        (:meth:`_at_preferred_home`) — so the two can never disagree about
+        which slot the setting names.
+        """
+        if not settings.home:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(settings.home)
+        except ClaudeSwitchError:
+            # Unresolvable or ambiguous (e.g. two slots sharing an email).
+            # Never guess which slot the user meant — hold and let the
+            # below-threshold path answer as it does today.
+            return None
+
+    def _at_preferred_home(
+        self, settings: AutoSwitchSettings, current: str
+    ) -> bool:
+        """Are we sitting on a home that is still in rotation?
+
+        Used to suppress a proactive consume-first DEPARTURE. Naming a home
+        and choosing consume-first are two below-threshold rules pulling
+        opposite ways: consume-first wants the soonest-resetting account,
+        home-return wants home. Left alone they cycle forever on data that
+        never changes — measured 1 -> 2 -> 1 -> 3 -> 1 -> 2 across fixed
+        snapshots a cooldown apart, because `_no_return_account` only bars
+        the account we most recently left and a third account keeps feeding
+        the loop a fresh target.
+
+        Naming an account wins. It is the explicit, standing instruction;
+        consume-first is an optimization over perishable quota, and the cost
+        of honouring home is bounded (weekly quota that would have been burned
+        first is burned later, or lost) while the cost of the cycle is not.
+        Departures at/above the threshold are untouched — those are the whole
+        point of the engine.
+
+        A DISABLED home is not preferred: `cswap disable` is the user's own
+        "hold this out of rotation", which is newer and more specific than a
+        home set earlier.
+        """
+        num = self._resolved_home(settings)
+        return (
+            num is not None
+            and num == current
+            and num in self.switcher.switchable_account_numbers()
+        )
+
     def _home_return_target(
         self,
         settings: AutoSwitchSettings,
@@ -1476,15 +1542,7 @@ class AutoSwitchEngine:
         predicate is therefore re-run against the phase-2 refetch before the
         move commits; on its own it is necessary, not sufficient.
         """
-        if not settings.home:
-            return None
-        try:
-            num = self.switcher._resolve_account_identifier(settings.home)
-        except ClaudeSwitchError:
-            # Unresolvable or ambiguous (e.g. two slots sharing an email).
-            # Never guess which slot the user meant — hold and let the
-            # below-threshold path answer as it does today.
-            return None
+        num = self._resolved_home(settings)
         if num is None or num == current or num in quarantined:
             return None
         if num not in self.switcher.switchable_account_numbers():

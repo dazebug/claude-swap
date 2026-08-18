@@ -7187,3 +7187,70 @@ class TestHomeReturnFreshnessAndKind:
 
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+
+class TestHomeWithConsumeFirst:
+    """`home` + `consume-first`: two proactive below-threshold triggers.
+
+    home-return was written as orthogonal to `strategy`, but consume-first is
+    the one strategy that also moves BELOW the threshold. Its departure rule
+    (go to the soonest weekly reset) and home-return's return rule (go to
+    home) are not disjoint, so the pair can cycle forever on data that never
+    changes.
+    """
+
+    def test_consume_first_does_not_drag_us_off_a_healthy_home(self, temp_home):
+        """Fixed snapshot, one cooldown apart: the active account must settle.
+
+        home #1 resets LAST, so consume-first always wants to leave it; home
+        -return always wants to come back. `_no_return_account` cannot break
+        the tie because it only bars the account we most recently left, and a
+        third account keeps the cycle supplied with a fresh target.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, home="1", strategy="consume-first"
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        snapshot = {
+            "1": _usage7(20, 20, _R_LATEST),  # home, resets last
+            "2": _usage7(20, 20, _R_SOON),
+            "3": _usage7(20, 20, _R_LATER),
+        }
+
+        seen = []
+        for _ in range(6):
+            h.tick_with_usage(snapshot)
+            seen.append(h.active_number())
+            h.clock.advance(301)  # clear the cooldown between ticks
+
+        assert seen == [1, 1, 1, 1, 1, 1], (
+            f"nothing about the usage changed, yet the engine kept moving: "
+            f"{seen}. Naming a home means preferring it; consume-first must "
+            f"not drag us off a home that is still under the threshold"
+        )
+
+    def test_other_strategies_keep_the_below_threshold_event_verbatim(
+        self, temp_home
+    ):
+        """The cycle fix must not spread beyond consume-first.
+
+        Only consume-first can reach a move from a healthy home, so only it
+        needs intercepting. Sitting on home under `best` must still report
+        `below-threshold`, not a new reason -- an event rename is a behaviour
+        change for anyone parsing `cswap auto --json`.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, home="1", strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": _usage7(20, 20), "2": _usage7(10, 10)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
