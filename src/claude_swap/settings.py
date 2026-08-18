@@ -149,7 +149,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "home", "home", "string",
-            help="Account to return to once its window is back under the threshold",
+            help="Spend this account first; others are overflow while it is at its limit",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

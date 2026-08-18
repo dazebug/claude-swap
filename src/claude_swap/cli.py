@@ -645,9 +645,10 @@ Defaults live in settings.json in the backup root; flags override them.
         "--home",
         metavar="ACCOUNT",
         help=(
-            "Prefer this account (alias, slot number, or email): return to it "
-            "as soon as its window is back under the threshold, and do not let "
-            "consume-first move off it while it is healthy"
+            "Spend this account first (alias, slot number, or email). The others "
+            "become overflow: you stay on it until it hits the threshold and are "
+            "moved back as soon as its window resets. Naming an account makes it "
+            "burn sooner, not later"
         ),
     )
     parser.add_argument(

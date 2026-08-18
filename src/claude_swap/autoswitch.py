@@ -985,14 +985,14 @@ class AutoSwitchEngine:
                     settings, headroom, quarantined, current
                 )
                 if home_num is not None:
-                    # Home's window is back under the threshold. Go home
-                    # whatever the strategy: `home` answers "which account do
-                    # I prefer", `strategy` answers "how do I pick a target
-                    # when leaving", so home is a separate axis rather than a
-                    # fourth value competing for the one strategy slot.
-                    # Separate is not independent, though — consume-first also
-                    # moves below the threshold, and the two rules cycle
-                    # unless its departure is suppressed (`_at_preferred_home`).
+                    # Home's window is back under the threshold, so resume
+                    # spending it. `home` is a spend-order rule: it names the
+                    # account to burn first and makes every other one overflow.
+                    # That is the same question `consume-first` answers, with
+                    # a different anchor (a name the user chose, rather than
+                    # the soonest weekly reset) -- which is exactly why the two
+                    # cannot both be live. A spend order has ONE anchor; the
+                    # user's wins, and `_at_preferred_home` enforces it.
                     trigger = "home-return"
                 elif settings.strategy != "consume-first":
                     self._emit(
@@ -1477,21 +1477,25 @@ class AutoSwitchEngine:
     ) -> bool:
         """Are we sitting on a home that is still in rotation?
 
-        Used to suppress a proactive consume-first DEPARTURE. Naming a home
-        and choosing consume-first are two below-threshold rules pulling
-        opposite ways: consume-first wants the soonest-resetting account,
-        home-return wants home. Left alone they cycle forever on data that
-        never changes — measured 1 -> 2 -> 1 -> 3 -> 1 -> 2 across fixed
-        snapshots a cooldown apart, because `_no_return_account` only bars
-        the account we most recently left and a third account keeps feeding
-        the loop a fresh target.
+        Used to suppress a proactive consume-first DEPARTURE, because a
+        spend order can only have ONE anchor.
 
-        Naming an account wins. It is the explicit, standing instruction;
-        consume-first is an optimization over perishable quota, and the cost
-        of honouring home is bounded (weekly quota that would have been burned
-        first is burned later, or lost) while the cost of the cycle is not.
-        Departures at/above the threshold are untouched — those are the whole
-        point of the engine.
+        `home` and `consume-first` are not opposites, they are the same kind
+        of rule: both decide which account's quota gets burned first, and
+        they differ only in who picks the anchor — a name the user gave, or
+        the soonest weekly reset found in the data. Two anchors cannot both
+        be live, and left alone they do not merely disagree once, they cycle
+        forever on data that never changes: measured 1 -> 2 -> 1 -> 3 -> 1 ->
+        2 across fixed snapshots a cooldown apart, because
+        `_no_return_account` bars only the account we most recently left and
+        a third account keeps feeding the loop a fresh target.
+
+        The user's anchor wins. It is an explicit standing instruction, while
+        consume-first is an inference from reset times; and the cost of
+        honouring it is bounded (perishable weekly quota that would have been
+        burned first is burned later, or lost) where the cost of the cycle is
+        not. Departures at/above the threshold are untouched — those are not
+        a spend-order question, they are the engine's whole point.
 
         A DISABLED home is not preferred: `cswap disable` is the user's own
         "hold this out of rotation", which is newer and more specific than a
