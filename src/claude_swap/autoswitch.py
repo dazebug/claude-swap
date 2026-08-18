@@ -1215,7 +1215,7 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "home-return") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1234,17 +1234,43 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts = _rank(
-                trigger=trigger,
-                consume_first=consume_first,
-                oauth_candidates=oauth_candidates,
-                usage=usage,
-                headroom=headroom,
-                current=current,
-                active_headroom=active_headroom,
-                settings=settings,
-                now=decided_now,
-            )
+            if trigger == "home-return":
+                # Re-ask the same question of the fresh data. Home is a
+                # CANDIDATE, so its stored snapshot can be up to
+                # CANDIDATE_MAX_INTERVAL_S old, and a stale-LOW reading is
+                # exactly the case `_home_return_target`'s no-flap argument
+                # cannot cover: that argument is about home's true
+                # utilization, which only falls on a window reset, while a
+                # stale value can read low because home was burned from
+                # another machine or a `cswap run` terminal since. Returning
+                # on it would land on a spent home and leave again next tick.
+                home_num = self._home_return_target(
+                    settings, headroom, quarantined, current
+                )
+                if home_num is None:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="home-unavailable",
+                            detail=(
+                                "home is no longer under the threshold on "
+                                "fresh usage; staying put"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                ordered = [home_num]
+            else:
+                ordered, any_known, active_reset_ts = _rank(
+                    trigger=trigger,
+                    consume_first=consume_first,
+                    oauth_candidates=oauth_candidates,
+                    usage=usage,
+                    headroom=headroom,
+                    current=current,
+                    active_headroom=active_headroom,
+                    settings=settings,
+                    now=decided_now,
+                )
 
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
@@ -1342,7 +1368,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "home-return"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1442,6 +1468,13 @@ class AutoSwitchEngine:
         event this feature exists to catch. That is a different shape from
         the pair-relative gates ``_no_return_account`` guards, where burn
         re-opens a move repeatedly and ``[1, 2, 1, 2]`` is reachable.
+
+        That argument is about home's TRUE utilization, and home is a
+        candidate, so what the caller holds may be minutes old. A stale-LOW
+        reading — home burned from another machine or a ``cswap run``
+        terminal since the snapshot — is the one shape that defeats it. This
+        predicate is therefore re-run against the phase-2 refetch before the
+        move commits; on its own it is necessary, not sufficient.
         """
         if not settings.home:
             return None
@@ -1455,6 +1488,15 @@ class AutoSwitchEngine:
         if num is None or num == current or num in quarantined:
             return None
         if num not in self.switcher.switchable_account_numbers():
+            return None
+        if (
+            self.switcher.account_kind_for(num) == "api_key"
+            and not settings.include_api_key_accounts
+        ):
+            # The ranking path keeps metered accounts as a last resort; this
+            # path skips `_rank`, so it carries that rule itself rather than
+            # leaning on API-key accounts happening to report unreadable
+            # headroom somewhere else in the codebase.
             return None
         h = headroom.get(num)
         if h is None or (100.0 - h) >= settings.threshold:

@@ -7084,3 +7084,106 @@ class TestHomeAccountWithMoreThanTwoAccounts:
         assert h.active_number() == 3
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
+
+
+class TestHomeReturnFreshnessAndKind:
+    """The two ways a naive home-return lands somewhere it should not."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _two_phase_tick(
+        self, h: EngineHarness, stored: dict, fresh: dict
+    ) -> tuple[TickOutcome, list[set]]:
+        fetch_sets: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            requested = set(fetch or ())
+            fetch_sets.append(requested)
+            view = fresh if requested == {"1", "2", "3"} else stored
+            return {
+                num: _entry_for(value, h.clock.now) for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick()
+        return outcome, fetch_sets
+
+    def test_a_stale_home_snapshot_does_not_trigger_a_doomed_return(self, temp_home):
+        """Home is a CANDIDATE, so its snapshot can be minutes old.
+
+        `_home_return_target` argues home-return cannot flap because home's
+        utilization only falls on a window reset. That holds for the TRUE
+        value; it does not hold for a stale one. Home can be burned from
+        another machine or a `cswap run` terminal while we are away, and a
+        stale-low reading would send us back to a spent home and straight out
+        again on the next tick — the one way the no-flap argument is
+        defeated. consume-first already re-decides on fresh data before
+        committing a below-threshold move; home-return has the same exposure.
+        """
+        h = self._harness(temp_home, home="2")
+        stored = {
+            "1": _usage7(20, 20),
+            "2": _usage7(10, 10),    # home looks recovered...
+            "3": _usage7(20, 20),
+        }
+        fresh = {
+            "1": _usage7(20, 20),
+            "2": _usage7(99, 99),    # ...but it was burned elsewhere since
+            "3": _usage7(20, 20),
+        }
+
+        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "returned home on a stale snapshot; the fresh read shows home "
+            "spent, so this lands on an exhausted account and leaves again "
+            "next tick"
+        )
+        assert h.active_number() == 1
+        assert {"1", "2", "3"} in fetch_sets, "phase-2 refetch never happened"
+
+    def test_a_fresh_confirmation_still_returns_home(self, temp_home):
+        """The refetch is a check, not a veto: agreeing data still switches."""
+        h = self._harness(temp_home, home="2")
+        view = {
+            "1": _usage7(20, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        }
+
+        outcome, fetch_sets = self._two_phase_tick(h, view, view)
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert {"1", "2", "3"} in fetch_sets
+
+    def test_an_api_key_home_is_never_returned_to(self, temp_home):
+        """`include_api_key_accounts` must gate home like every other target.
+
+        The ranking path splits OAuth from API-key candidates and keeps the
+        metered ones as a last resort; home-return skips `_rank` entirely, so
+        it has to carry that rule itself. Relying on API-key accounts merely
+        happening to report unreadable headroom leaves the invariant to an
+        accident somewhere else in the codebase.
+        """
+        h = self._harness(temp_home, home="2")
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),
+            "2": _usage7(0, 0),      # a readable, wide-open API-key home
+            "3": _usage7(20, 20),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
