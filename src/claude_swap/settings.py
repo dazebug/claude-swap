@@ -447,6 +447,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("home", "home"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

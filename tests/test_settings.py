@@ -273,6 +273,12 @@ class TestMergedWithCli:
         )
         assert merged.include_api_key_accounts is True
 
+    def test_home_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(home="work"), _args(home="personal")
+        )
+        assert merged.home == "personal"
+
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"

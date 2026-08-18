@@ -7254,3 +7254,90 @@ class TestHomeWithConsumeFirst:
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
+
+
+class TestHomeReturnRefusesWhatItCannotTrust:
+    """Every way `autoswitch.home` can name something unusable.
+
+    Each one must fall through to today's below-threshold behaviour rather
+    than switch — the setting is a preference, not an override of the checks
+    that keep the engine off accounts it cannot use.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _healthy(self) -> dict:
+        return {"1": _usage7(20, 20), "2": _usage7(10, 10)}
+
+    def test_a_quarantined_home_is_not_returned_to(self, temp_home):
+        """A dead refresh token makes home unusable however preferred it is."""
+        h = self._harness(temp_home, home="2")
+        h.engine._quarantine("2", "b@example.com", "identity-conflict")
+
+        outcome = h.tick_with_usage(self._healthy())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_disabled_home_is_not_returned_to(self, temp_home):
+        """`cswap disable` is newer and more specific than a home set earlier."""
+        h = self._harness(temp_home, home="2")
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        outcome = h.tick_with_usage(self._healthy())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_ambiguous_home_email_never_guesses_a_slot(self, temp_home):
+        """Two slots, one email — resolution raises, and we must not pick one.
+
+        This is the real shape for anyone with a personal and an org account
+        under the same address: `cswap switch <email>` already refuses it, so
+        silently choosing a slot here would be worse than doing nothing.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, home="dup@example.com")
+        h.seed(1, "a@example.com")
+        h.seed(2, "dup@example.com")
+        h.seed(3, "dup@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_unknown_home_name_is_inert(self, temp_home):
+        """A typo'd or removed account must not break the tick."""
+        h = self._harness(temp_home, home="nope@example.com")
+
+        outcome = h.tick_with_usage(self._healthy())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_unreadable_home_holds_rather_than_guesses(self, temp_home):
+        """Unknown headroom is not 'probably fine'.
+
+        Landing on an account whose usage we cannot read would re-trigger
+        blind on the next tick — the same harm the landing gate in
+        `_rank_candidates` exists to prevent.
+        """
+        h = self._harness(temp_home, home="2")
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),
+            "2": USAGE_TOKEN_EXPIRED,   # sentinel: no readable window
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1

@@ -642,6 +642,15 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--home",
+        metavar="ACCOUNT",
+        help=(
+            "Prefer this account (alias, slot number, or email): return to it "
+            "as soon as its window is back under the threshold, and do not let "
+            "consume-first move off it while it is healthy"
+        ),
+    )
+    parser.add_argument(
         "--include-api-key-accounts",
         action=argparse.BooleanOptionalAction,
         default=None,
