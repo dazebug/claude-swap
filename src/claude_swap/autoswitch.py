@@ -986,11 +986,13 @@ class AutoSwitchEngine:
                 )
                 if home_num is not None:
                     # Home's window is back under the threshold. Go home
-                    # regardless of strategy: `home` answers "which account do
+                    # whatever the strategy: `home` answers "which account do
                     # I prefer", `strategy` answers "how do I pick a target
-                    # when leaving" — different questions, so this composes
-                    # with best and consume-first instead of competing for the
-                    # one strategy slot.
+                    # when leaving", so home is a separate axis rather than a
+                    # fourth value competing for the one strategy slot.
+                    # Separate is not independent, though — consume-first also
+                    # moves below the threshold, and the two rules cycle
+                    # unless its departure is suppressed (`_at_preferred_home`).
                     trigger = "home-return"
                 elif settings.strategy != "consume-first":
                     self._emit(
@@ -1525,22 +1527,33 @@ class AutoSwitchEngine:
           measure would re-trigger blind on the next tick, which is the same
           harm the landing gate in ``_rank_candidates`` exists to prevent.
 
-        WHY THIS CANNOT FLAP, despite bypassing the anti-flap gates. The
-        engine leaves home only at/above the threshold and returns only
-        strictly below it, so departure and return are disjoint conditions,
-        not two sides of a margin. Home's utilization rises monotonically
-        while it is active and cannot fall while it is not — the only thing
-        that moves it back down is a window reset, which is precisely the
-        event this feature exists to catch. That is a different shape from
-        the pair-relative gates ``_no_return_account`` guards, where burn
+        WHY RETURNING HERE DOES NOT FLAP, despite bypassing the anti-flap
+        gates — and what that argument depends on. Returning fires only
+        strictly below the threshold, and home's utilization rises
+        monotonically while it is active and cannot fall while it is not, so
+        the only thing that moves it back down is a window reset: the event
+        this feature exists to catch. That is a different shape from the
+        pair-relative gates ``_no_return_account`` guards, where burn
         re-opens a move repeatedly and ``[1, 2, 1, 2]`` is reachable.
 
-        That argument is about home's TRUE utilization, and home is a
-        candidate, so what the caller holds may be minutes old. A stale-LOW
-        reading — home burned from another machine or a ``cswap run``
-        terminal since the snapshot — is the one shape that defeats it. This
-        predicate is therefore re-run against the phase-2 refetch before the
-        move commits; on its own it is necessary, not sufficient.
+        The argument holds only while two things stay true elsewhere, and
+        BOTH were violated by the first version of this feature:
+
+        - Departure from home must happen only at/above the threshold. It is
+          not intrinsic — ``consume-first`` departs BELOW it, on the
+          unrelated axis of which weekly window resets soonest, and the pair
+          cycled forever on unchanging data until
+          :meth:`_at_preferred_home` suppressed that departure. Any future
+          strategy that can leave a healthy account needs the same
+          treatment or this predicate starts flapping again.
+        - The reading must be home's TRUE utilization. Home is a candidate,
+          so what the caller holds may be minutes old, and a stale-LOW value
+          (home burned from another machine or a ``cswap run`` terminal
+          since the snapshot) reads like a reset that never happened. The
+          caller therefore re-runs this predicate against the phase-2
+          refetch before committing.
+
+        On its own this predicate is necessary, not sufficient.
         """
         num = self._resolved_home(settings)
         if num is None or num == current or num in quarantined:
