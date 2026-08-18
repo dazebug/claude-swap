@@ -2782,6 +2782,34 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def _two_phase_tick(
+    h: EngineHarness, stored: dict, fresh: dict
+) -> tuple[TickOutcome, list[set]]:
+    """Drive one tick where stored-snapshot collections serve ``stored``
+    and the all-candidates escalation serves ``fresh``.
+
+    These ticks run outside the escalation band (utilization far below
+    threshold - ESCALATION_MARGIN_PCT), so the collector never escalates on
+    its own and the only all-candidates call a tick can make is the phase-2
+    refetch — the returned fetch sets prove whether it happened. Both paths
+    that refetch (consume-first and a forced drain target) share this helper
+    so the ``{"1", "2", "3"}`` fetch set they key on cannot drift apart in
+    one copy: a stale set silently serves ``stored`` to phase 2, and the
+    test then passes without ever exercising the verification it names.
+    """
+    fetch_sets: list[set] = []
+
+    def collect(fetch=None, **_kwargs):
+        requested = set(fetch or ())
+        fetch_sets.append(requested)
+        view = fresh if requested == {"1", "2", "3"} else stored
+        return {num: _entry_for(value, h.clock.now) for num, value in view.items()}
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+        outcome = h.engine.tick()
+    return outcome, fetch_sets
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -3067,35 +3095,6 @@ class TestConsumeFirstStrategy:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["reset-unknown"]
 
-    def _two_phase_tick(
-        self, h: EngineHarness, stored: dict, fresh: dict
-    ) -> tuple[TickOutcome, list[set]]:
-        """Drive one tick where stored-snapshot collections serve ``stored``
-        and the all-candidates escalation serves ``fresh``.
-
-        These ticks run outside the escalation band (utilization far below
-        threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
-        on its own and the only all-candidates call a tick can make is the
-        consume-first phase-2 refetch — the returned fetch sets prove whether
-        it happened.
-        """
-        fetch_sets: list[set] = []
-
-        def collect(fetch=None, **_kwargs):
-            requested = set(fetch or ())
-            fetch_sets.append(requested)
-            view = fresh if requested == {"1", "2", "3"} else stored
-            return {
-                num: _entry_for(value, h.clock.now)
-                for num, value in view.items()
-            }
-
-        with patch.object(
-            h.switcher, "usage_entries_by_account", side_effect=collect
-        ):
-            outcome = h.engine.tick()
-        return outcome, fetch_sets
-
     def test_two_phase_refetch_disqualifies_stale_pick(self, temp_home):
         # The stored snapshot ranks #2; the phase-2 refetch shows it
         # exhausted. The tick must re-decide on the fresh data and hold.
@@ -3110,7 +3109,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(100, 100, _R_SOON),   # burned out since the snapshot
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -3126,7 +3125,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, view, view)
+        outcome, fetch_sets = _two_phase_tick(h, view, view)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert {"1", "2", "3"} in fetch_sets
@@ -3146,7 +3145,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_LATER),    # still sooner than active
             "3": _usage7(10, 10, _R_SOON),     # but #3 is now soonest
         }
-        outcome, _ = self._two_phase_tick(h, stored, fresh)
+        outcome, _ = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
@@ -3168,7 +3167,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_LATEST),   # no longer strictly sooner
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
@@ -6906,7 +6905,7 @@ class TestDrainAccount:
     after one departure, even when its window has since reset.
 
     `consume-first` does not cover this: its anchor is "whichever weekly
-    window resets soonest", chosen from the data. `home` is chosen by the
+    window resets soonest", chosen from the data. A drain account is named by the
     user and does not move.
     """
 
@@ -6918,7 +6917,7 @@ class TestDrainAccount:
         return h
 
     def _leave_the_drain_account(self, h: EngineHarness) -> None:
-        """Burn home past the threshold so the ENGINE moves off it itself.
+        """Burn the drain account past the threshold so the ENGINE leaves it.
 
         Going through a real departure is the point: it arms `lastSwitchTo`
         and with it the `_no_return_account` bar (PR #202, "NEVER UNDO THE
@@ -6935,17 +6934,17 @@ class TestDrainAccount:
         h.events.clear()
 
     def test_returns_once_the_drain_account_is_back_under_the_threshold(self, temp_home):
-        """The whole feature: home's window reset, so go back to home."""
+        """The whole feature: the drain account's window reset, so go back."""
         h = self._harness(temp_home, drain_account="1")
         self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
-            "1": _usage7(10, 10),   # home recovered
+            "1": _usage7(10, 10),   # drain account recovered
             "2": _usage7(20, 20),   # away is fine too -- irrelevant
         })
 
         assert outcome is TickOutcome.SWITCHED, (
-            "home recovered and the engine is parked on the away account; "
+            "the drain account recovered but the engine is parked away; "
             "today the tick gate answers below-threshold NO_ACTION and the "
             "user never gets back to the account they chose"
         )
@@ -6954,12 +6953,12 @@ class TestDrainAccount:
         assert sw.trigger == "drain-return"
 
     def test_stays_away_while_the_drain_account_is_still_over_the_threshold(self, temp_home):
-        """Not a magnet: home has to actually be usable before we go back."""
+        """Not a magnet: the drain account must be usable before we go back."""
         h = self._harness(temp_home, drain_account="1")
         self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
-            "1": _usage7(95, 20),   # home still spent
+            "1": _usage7(95, 20),   # drain account still spent
             "2": _usage7(20, 20),
         })
 
@@ -6970,7 +6969,7 @@ class TestDrainAccount:
         """`hysteresis_pct` must not gate the return.
 
         Hysteresis exists to stop two accounts trading places while both
-        hover near the line -- it asks "is the target BETTER?". Home-return
+        hover near the line -- it asks "is the target BETTER?". Drain-return
         does not ask that question: the target is named, not ranked. Gating
         it here would strand the user on an away account that merely happens
         to have more headroom, which is the normal case after a return.
@@ -6979,7 +6978,7 @@ class TestDrainAccount:
         self._leave_the_drain_account(h)
 
         outcome = h.tick_with_usage({
-            "1": _usage7(80, 20),   # home usable, but WORSE than away
+            "1": _usage7(80, 20),   # drain usable, but WORSE than away
             "2": _usage7(5, 5),
         })
 
@@ -7003,31 +7002,31 @@ class TestDrainAccount:
 
 
 class TestDrainAccountWithMoreThanTwoAccounts:
-    """Home is one account among many — the other axes must keep working.
+    """The drain account is one among many — the other axes must keep working.
 
-    With exactly two accounts "leave home" and "go to the other one" are the
+    With two accounts "leave the drain account" and "go to the other one" are the
     same decision, so a two-account suite cannot tell whether drain-return
     distorts target selection or merely adds a return leg.
     """
 
     def _harness(self, temp_home: Path, **kw) -> EngineHarness:
         h = EngineHarness(temp_home, threshold=90.0, **kw)
-        h.seed(1, "a@example.com")   # home
+        h.seed(1, "a@example.com")   # drain account
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
         return h
 
     def test_departure_from_the_drain_account_still_obeys_the_strategy(self, temp_home):
-        """Naming a home must not bias which account we LEAVE to.
+        """Naming a drain account must not bias which account we LEAVE to.
 
-        home answers "where do I return", not "where do I go next" — the
+        it answers "where do I return", not "where do I go next" — the
         strategy still owns departure, so the most-headroom peer wins.
         """
         h = self._harness(temp_home, drain_account="1")
 
         outcome = h.tick_with_usage({
-            "1": _usage7(95, 20),   # home, spent -> must leave
+            "1": _usage7(95, 20),   # drain account, spent -> must leave
             "2": _usage7(50, 50),
             "3": _usage7(10, 10),   # most headroom -> `best` picks this
         })
@@ -7036,7 +7035,7 @@ class TestDrainAccountWithMoreThanTwoAccounts:
         assert h.active_number() == 3
 
     def test_returns_to_the_drain_account_not_the_roomiest_peer(self, temp_home):
-        """The return target is home, not whoever ranks best."""
+        """The return target is the drain account, not whoever ranks best."""
         h = self._harness(temp_home, drain_account="1")
         assert h.tick_with_usage({
             "1": _usage7(95, 20),
@@ -7048,8 +7047,8 @@ class TestDrainAccountWithMoreThanTwoAccounts:
         h.events.clear()
 
         outcome = h.tick_with_usage({
-            "1": _usage7(40, 20),   # home recovered, but NOT the roomiest
-            "2": _usage7(1, 1),     # roomiest by far -- must lose to home
+            "1": _usage7(40, 20),   # drain recovered, but NOT the roomiest
+            "2": _usage7(1, 1),     # roomiest by far -- must lose to drain
             "3": _usage7(30, 30),
         })
 
@@ -7059,9 +7058,9 @@ class TestDrainAccountWithMoreThanTwoAccounts:
         assert sw.trigger == "drain-return"
 
     def test_no_shuffling_between_peers_while_the_drain_account_is_spent(self, temp_home):
-        """Below the threshold with home unusable, today's NO_ACTION stands.
+        """Below the threshold with the drain account unusable, NO_ACTION stands.
 
-        A home that cannot be returned to must not turn the gate into a
+        A drain account that cannot be returned to must not turn the gate into a
         general-purpose "move to the roomiest account" rule.
         """
         h = self._harness(temp_home, drain_account="1")
@@ -7075,7 +7074,7 @@ class TestDrainAccountWithMoreThanTwoAccounts:
         h.events.clear()
 
         outcome = h.tick_with_usage({
-            "1": _usage7(95, 20),   # home still spent
+            "1": _usage7(95, 20),   # drain account still spent
             "2": _usage7(1, 1),     # far roomier than where we are
             "3": _usage7(30, 30),
         })
@@ -7097,33 +7096,14 @@ class TestDrainReturnFreshnessAndKind:
         h.make_live("a@example.com", 1)
         return h
 
-    def _two_phase_tick(
-        self, h: EngineHarness, stored: dict, fresh: dict
-    ) -> tuple[TickOutcome, list[set]]:
-        fetch_sets: list[set] = []
-
-        def collect(fetch=None, **_kwargs):
-            requested = set(fetch or ())
-            fetch_sets.append(requested)
-            view = fresh if requested == {"1", "2", "3"} else stored
-            return {
-                num: _entry_for(value, h.clock.now) for num, value in view.items()
-            }
-
-        with patch.object(
-            h.switcher, "usage_entries_by_account", side_effect=collect
-        ):
-            outcome = h.engine.tick()
-        return outcome, fetch_sets
-
     def test_a_stale_drain_account_snapshot_does_not_trigger_a_doomed_return(self, temp_home):
-        """Home is a CANDIDATE, so its snapshot can be minutes old.
+        """The drain account is a CANDIDATE, so its snapshot can be minutes old.
 
-        `_drain_account_target` argues drain-return cannot flap because home's
+        `_drain_account_target` argues drain-return cannot flap because its
         utilization only falls on a window reset. That holds for the TRUE
-        value; it does not hold for a stale one. Home can be burned from
+        value; it does not hold for a stale one. It can be burned from
         another machine or a `cswap run` terminal while we are away, and a
-        stale-low reading would send us back to a spent home and straight out
+        stale-low reading would send us back to a spent account and straight out
         again on the next tick — the one way the no-flap argument is
         defeated. consume-first already re-decides on fresh data before
         committing a below-threshold move; drain-return has the same exposure.
@@ -7131,7 +7111,7 @@ class TestDrainReturnFreshnessAndKind:
         h = self._harness(temp_home, drain_account="2")
         stored = {
             "1": _usage7(20, 20),
-            "2": _usage7(10, 10),    # home looks recovered...
+            "2": _usage7(10, 10),    # drain looks recovered...
             "3": _usage7(20, 20),
         }
         fresh = {
@@ -7140,10 +7120,10 @@ class TestDrainReturnFreshnessAndKind:
             "3": _usage7(20, 20),
         }
 
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
 
         assert outcome is TickOutcome.NO_ACTION, (
-            "returned home on a stale snapshot; the fresh read shows home "
+            "returned on a stale snapshot; the fresh read shows the drain "
             "spent, so this lands on an exhausted account and leaves again "
             "next tick"
         )
@@ -7159,14 +7139,14 @@ class TestDrainReturnFreshnessAndKind:
             "3": _usage7(20, 20),
         }
 
-        outcome, fetch_sets = self._two_phase_tick(h, view, view)
+        outcome, fetch_sets = _two_phase_tick(h, view, view)
 
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert {"1", "2", "3"} in fetch_sets
 
     def test_an_api_key_drain_account_is_never_returned_to(self, temp_home):
-        """`include_api_key_accounts` must gate home like every other target.
+        """`include_api_key_accounts` must gate this like every other target.
 
         The ranking path splits OAuth from API-key candidates and keeps the
         metered ones as a last resort; drain-return skips `_rank` entirely, so
@@ -7181,7 +7161,7 @@ class TestDrainReturnFreshnessAndKind:
 
         outcome = h.tick_with_usage({
             "1": _usage7(20, 20),
-            "2": _usage7(0, 0),      # a readable, wide-open API-key home
+            "2": _usage7(0, 0),      # a readable, wide-open API-key drain
             "3": _usage7(20, 20),
         })
 
@@ -7190,20 +7170,20 @@ class TestDrainReturnFreshnessAndKind:
 
 
 class TestDrainAccountWithConsumeFirst:
-    """`home` + `consume-first`: two proactive below-threshold triggers.
+    """`drainAccount` + `consume-first`: two below-threshold triggers.
 
     drain-return was written as orthogonal to `strategy`, but consume-first is
     the one strategy that also moves BELOW the threshold. Its departure rule
     (go to the soonest weekly reset) and drain-return's return rule (go to
-    home) are not disjoint, so the pair can cycle forever on data that never
+    the drain account) are not disjoint, so the pair cycles on data that never
     changes.
     """
 
     def test_consume_first_does_not_drag_us_off_a_healthy_drain_account(self, temp_home):
         """Fixed snapshot, one cooldown apart: the active account must settle.
 
-        home #1 resets LAST, so consume-first always wants to leave it; home
-        -return always wants to come back. `_no_return_account` cannot break
+        drain #1 resets LAST, so consume-first always wants to leave it;
+        drain-return always wants to come back. `_no_return_account` cannot break
         the tie because it only bars the account we most recently left, and a
         third account keeps the cycle supplied with a fresh target.
         """
@@ -7216,7 +7196,7 @@ class TestDrainAccountWithConsumeFirst:
         h.make_live("a@example.com", 1)
 
         snapshot = {
-            "1": _usage7(20, 20, _R_LATEST),  # home, resets last
+            "1": _usage7(20, 20, _R_LATEST),  # drain account, resets last
             "2": _usage7(20, 20, _R_SOON),
             "3": _usage7(20, 20, _R_LATER),
         }
@@ -7229,8 +7209,8 @@ class TestDrainAccountWithConsumeFirst:
 
         assert seen == [1, 1, 1, 1, 1, 1], (
             f"nothing about the usage changed, yet the engine kept moving: "
-            f"{seen}. Naming a home means preferring it; consume-first must "
-            f"not drag us off a home that is still under the threshold"
+            f"{seen}. Naming a drain account means preferring it; "
+            f"consume-first must not drag us off one still under the threshold"
         )
 
     def test_other_strategies_keep_the_below_threshold_event_verbatim(
@@ -7238,8 +7218,8 @@ class TestDrainAccountWithConsumeFirst:
     ):
         """The cycle fix must not spread beyond consume-first.
 
-        Only consume-first can reach a move from a healthy home, so only it
-        needs intercepting. Sitting on home under `best` must still report
+        Only consume-first can reach a move from a healthy drain account, so
+        only it needs intercepting. Sitting on it under `best` must still report
         `below-threshold`, not a new reason -- an event rename is a behaviour
         change for anyone parsing `cswap auto --json`.
         """
@@ -7275,7 +7255,7 @@ class TestDrainReturnRefusesWhatItCannotTrust:
         return {"1": _usage7(20, 20), "2": _usage7(10, 10)}
 
     def test_a_quarantined_drain_account_is_not_returned_to(self, temp_home):
-        """A dead refresh token makes home unusable however preferred it is."""
+        """A dead refresh token makes it unusable however preferred it is."""
         h = self._harness(temp_home, drain_account="2")
         h.engine._quarantine("2", "b@example.com", "identity-conflict")
 
@@ -7285,7 +7265,7 @@ class TestDrainReturnRefusesWhatItCannotTrust:
         assert h.active_number() == 1
 
     def test_a_disabled_drain_account_is_not_returned_to(self, temp_home):
-        """`cswap disable` is newer and more specific than a home set earlier."""
+        """`cswap disable` is newer and more specific than a drain set earlier."""
         h = self._harness(temp_home, drain_account="2")
         data = h.switcher._get_sequence_data()
         data["accounts"]["2"]["disabled"] = True
@@ -7346,7 +7326,7 @@ class TestDrainReturnRefusesWhatItCannotTrust:
 class TestDrainReturnHonoursTheModelWindow:
     """`autoswitch.model` must gate the return, not just the departure.
 
-    Home reads its headroom from the same `_headroom_by_account` the rest of
+    Drain-return reads headroom from the same `_headroom_by_account` the rest of
     the engine uses, so folding a per-model weekly window in should apply for
     free. "For free" is exactly the kind of inherited property that breaks
     silently later, and it is the live configuration here: an account whose
@@ -7370,7 +7350,7 @@ class TestDrainReturnHonoursTheModelWindow:
         })
 
         assert outcome is TickOutcome.NO_ACTION, (
-            "returned to a home whose Fable weekly window is at 95%: the "
+            "returned to a drain account whose Fable weekly window is at 95%: the "
             "5h/7d headroom says it is fine, but the model the user actually "
             "works in is blocked there"
         )
