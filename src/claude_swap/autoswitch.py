@@ -1311,11 +1311,22 @@ class AutoSwitchEngine:
                     # NOT fine — we cannot even read it — so the must-move
                     # contract outranks the drain order. Drop the hard target
                     # and let ordinary ranking pick from the fresh data.
+                    #
+                    # The unverified account is dropped from that ranking too,
+                    # and it has to be: ranking scores on headroom, so a
+                    # stale-LOW drain row simply looks like the roomiest
+                    # candidate and gets re-picked, making the verification
+                    # above decorative. Measured with a 240s 20% drain row
+                    # against a fresh 50% peer. Excluded only for THIS tick —
+                    # the next one refetches and it competes normally.
                     drain_forced = False
+                    unverified = self._resolved_drain_account(settings)
                     ordered, any_known, active_reset_ts = _rank(
                         trigger=trigger,
                         consume_first=consume_first,
-                        oauth_candidates=oauth_candidates,
+                        oauth_candidates=[
+                            n for n in oauth_candidates if n != unverified
+                        ],
                         usage=usage,
                         headroom=headroom,
                         current=current,

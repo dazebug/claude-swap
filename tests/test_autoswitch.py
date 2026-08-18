@@ -7555,7 +7555,11 @@ class TestDrainReturnOutranksTheOverflowAccountsState:
         outcome = h.tick_with_entries({
             "1": stale,                                   # drain, but not fresh
             "2": _entry_for(None, now),                   # unreadable -> failover
-            "3": _entry_for(_usage7(0, 0), now),          # fresh peer
+            # Fresh, and DELIBERATELY worse than the stale drain row. With the
+            # peer roomier the drain loses on merit and the test passes without
+            # the exclusion ever running — it has to be the one that looks
+            # better on stale data for this to isolate the mechanism.
+            "3": _entry_for(_usage7(50, 50), now),
         })
 
         assert outcome is TickOutcome.SWITCHED, (
@@ -7564,6 +7568,8 @@ class TestDrainReturnOutranksTheOverflowAccountsState:
         )
         assert h.active_number() == 3, (
             "landed on the drain account from a 240s-old row without "
-            "re-verifying it; a stale-low reading is indistinguishable from "
-            "a reset that never happened"
+            "re-verifying it. A stale-low reading is indistinguishable from a "
+            "reset that never happened, and dropping the hard target is not "
+            "enough on its own: ordinary ranking will re-pick the same "
+            "unverified account whenever it looks the roomiest"
         )
