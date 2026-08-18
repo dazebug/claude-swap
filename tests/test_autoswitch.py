@@ -2788,14 +2788,20 @@ def _two_phase_tick(
     """Drive one tick where stored-snapshot collections serve ``stored``
     and the all-candidates escalation serves ``fresh``.
 
-    These ticks run outside the escalation band (utilization far below
-    threshold - ESCALATION_MARGIN_PCT), so the collector never escalates on
-    its own and the only all-candidates call a tick can make is the phase-2
-    refetch — the returned fetch sets prove whether it happened. Both paths
-    that refetch (consume-first and a forced drain target) share this helper
-    so the ``{"1", "2", "3"}`` fetch set they key on cannot drift apart in
-    one copy: a stale set silently serves ``stored`` to phase 2, and the
-    test then passes without ever exercising the verification it names.
+    Only usable while the tick stays OUTSIDE the escalation band
+    (utilization far below threshold - ESCALATION_MARGIN_PCT). The phases
+    are told apart by the ``{"1", "2", "3"}`` fetch set, and that identifies
+    the phase-2 refetch only as long as the collector does not reach for
+    everyone on its own. Inside the band it does, so the GATE is served
+    ``fresh`` and the tick never forces a phase-2 decision at all — measured
+    while writing
+    ``test_a_failover_moves_on_when_the_drain_account_stops_qualifying``,
+    which discriminates by call ORDER for exactly that reason.
+
+    Shared by both refetching paths (consume-first and a forced drain
+    target) so that fetch set cannot drift in one copy: a set that stops
+    matching does not fail, it serves ``stored`` to phase 2 and the test
+    passes without exercising the verification it is named after.
     """
     fetch_sets: list[set] = []
 
@@ -7553,3 +7559,85 @@ class TestDrainReturnOutranksTheOverflowAccountsState:
             "enough on its own: ordinary ranking will re-pick the same "
             "unverified account whenever it looks the roomiest"
         )
+
+    def test_a_failover_moves_on_when_the_drain_account_stops_qualifying(
+        self, temp_home
+    ):
+        """The hold that is right for `drain-return` is wrong for `failover`.
+
+        Phase 2 can find the drain account not merely stale but no longer
+        under the threshold at all — burned elsewhere between the snapshot
+        the gate read and the refetch. For `drain-return` the answer is to
+        hold and say `drain-unavailable`: the active account is healthy, so
+        staying put is a correct outcome. `failover` fires because the active
+        account cannot even be READ, so holding is the one thing it must
+        never do.
+
+        Only the ORDER of two branches separates those cases — a failover
+        whose drain account stopped qualifying satisfies both — and nothing
+        else pins it: with this test absent, swapping the two arms leaves the
+        whole suite green while every failover in this state stalls.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        stored = {
+            "1": _usage7(20, 20),   # drain looks recovered -> forced target
+            "2": None,              # where we are: unreadable -> failover
+            "3": _usage7(50, 50),
+        }
+        # The drain account was burned elsewhere since, so the refetch
+        # disqualifies it outright rather than merely finding it stale.
+        fresh = {**stored, "1": _usage7(99, 99)}
+        served: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            # `_two_phase_tick` cannot express this tick. It tells the two
+            # phases apart by the all-candidates fetch set, which holds only
+            # while the collector does not escalate on its own — and here it
+            # does, because the account we are on is unreadable. So the gate
+            # would already see `fresh`, the drain would never be forced, and
+            # phase 2 would never run at all (measured: the branch under test
+            # was not reached even once).
+            #
+            # Order tells them apart instead: the pre-gate escalation comes
+            # first, the phase-2 refetch second.
+            requested = set(fetch or ())
+            served.append(requested)
+            everyone = requested == {"1", "2", "3"}
+            phase2 = everyone and served.count({"1", "2", "3"}) > 1
+            view = fresh if phase2 else stored
+            return {
+                num: _entry_for(value, h.clock.now) for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick()
+
+        assert served.count({"1", "2", "3"}) > 1, (
+            "the phase-2 refetch never happened, so nothing re-asked whether "
+            "the drain account still qualifies"
+        )
+        assert outcome is TickOutcome.SWITCHED, (
+            "stalled on an account it cannot read because the drain account "
+            "stopped qualifying; that answer belongs to drain-return, which "
+            "has a healthy account to stay on"
+        )
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"

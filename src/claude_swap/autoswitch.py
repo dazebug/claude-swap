@@ -1315,18 +1315,13 @@ class AutoSwitchEngine:
                 stale = entry is None or not entry.fresh(self.clock())
                 if drain_num is not None and not stale:
                     ordered = [drain_num]
-                # ORDER MATTERS, AND NOTHING ENFORCES IT. This arm sits
-                # ahead of the `drain_num is None` one on purpose: both
-                # conditions hold for a failover whose drain account stopped
-                # qualifying on the fresh data, and the other arm HOLDS —
-                # the one thing failover must never do.
-                #
-                # Measured by swapping the two arms: the whole suite still
-                # passes, 283/283. There is no test for "failover + drain no
-                # longer qualifies", so this ordering is the only thing
-                # standing between that path and a silent must-move
-                # violation. Add that case and this paragraph can shrink to
-                # its first sentence.
+                # ORDER MATTERS. This arm sits ahead of the `drain_num is
+                # None` one on purpose: both conditions hold for a failover
+                # whose drain account stopped qualifying on the fresh data,
+                # and the other arm HOLDS — the one thing failover must never
+                # do. Pinned by
+                # `test_a_failover_moves_on_when_the_drain_account_stops_qualifying`,
+                # which fails if the two are swapped.
                 elif trigger == "failover":
                     # Holding is what `drain-return` does here, and it is right
                     # for it: staying put is a correct outcome when the active
