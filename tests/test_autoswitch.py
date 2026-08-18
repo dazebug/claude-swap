@@ -7000,3 +7000,87 @@ class TestHomeAccount:
         assert h.active_number() == 2
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
+
+
+class TestHomeAccountWithMoreThanTwoAccounts:
+    """Home is one account among many — the other axes must keep working.
+
+    With exactly two accounts "leave home" and "go to the other one" are the
+    same decision, so a two-account suite cannot tell whether home-return
+    distorts target selection or merely adds a return leg.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")   # home
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_departure_from_home_still_obeys_the_strategy(self, temp_home):
+        """Naming a home must not bias which account we LEAVE to.
+
+        home answers "where do I return", not "where do I go next" — the
+        strategy still owns departure, so the most-headroom peer wins.
+        """
+        h = self._harness(temp_home, home="1")
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),   # home, spent -> must leave
+            "2": _usage7(50, 50),
+            "3": _usage7(10, 10),   # most headroom -> `best` picks this
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_returns_home_rather_than_to_the_roomiest_peer(self, temp_home):
+        """The return target is home, not whoever ranks best."""
+        h = self._harness(temp_home, home="1")
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(50, 50),
+            "3": _usage7(10, 10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 20),   # home recovered, but NOT the roomiest
+            "2": _usage7(1, 1),     # roomiest by far -- must lose to home
+            "3": _usage7(30, 30),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "home-return"
+
+    def test_no_shuffling_between_peers_while_home_is_still_spent(self, temp_home):
+        """Below the threshold with home unusable, today's NO_ACTION stands.
+
+        A home that cannot be returned to must not turn the gate into a
+        general-purpose "move to the roomiest account" rule.
+        """
+        h = self._harness(temp_home, home="1")
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(50, 50),
+            "3": _usage7(10, 10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),   # home still spent
+            "2": _usage7(1, 1),     # far roomier than where we are
+            "3": _usage7(30, 30),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
