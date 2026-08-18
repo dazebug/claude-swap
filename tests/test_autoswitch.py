@@ -2788,15 +2788,19 @@ def _two_phase_tick(
     """Drive one tick where stored-snapshot collections serve ``stored``
     and the all-candidates escalation serves ``fresh``.
 
-    Only usable while the tick stays OUTSIDE the escalation band
-    (utilization far below threshold - ESCALATION_MARGIN_PCT). The phases
-    are told apart by the ``{"1", "2", "3"}`` fetch set, and that identifies
-    the phase-2 refetch only as long as the collector does not reach for
-    everyone on its own. Inside the band it does, so the GATE is served
-    ``fresh`` and the tick never forces a phase-2 decision at all — measured
-    while writing
-    ``test_a_failover_moves_on_when_the_drain_account_stops_qualifying``,
-    which discriminates by call ORDER for exactly that reason.
+    Usable only on ticks where the collector does not reach for every
+    candidate on its own, because such a call is indistinguishable from the
+    phase-2 refetch — both ask for ``{current, *candidates}``, and the fetch
+    set is all this has to tell the phases apart. ``escalate`` in
+    `_collect_scheduled_usage` reaches for everyone in TWO cases, not one: when the
+    active account's utilization is within ``ESCALATION_MARGIN_PCT`` of the
+    threshold, and when its headroom cannot be read at all. Either way the
+    GATE is served ``fresh``, so nothing is ever provisionally decided on
+    ``stored`` and the phase-2 branch under test is not reached at all.
+
+    The unreadable case is measured, not reasoned: it is why
+    ``test_a_failover_moves_on_when_the_drain_account_stops_qualifying``
+    discriminates by call ORDER instead of using this helper.
 
     Shared by both refetching paths (consume-first and a forced drain
     target) so that fetch set cannot drift in one copy: a set that stops
@@ -7606,12 +7610,13 @@ class TestDrainReturnOutranksTheOverflowAccountsState:
 
         def collect(fetch=None, **_kwargs):
             # `_two_phase_tick` cannot express this tick. It tells the two
-            # phases apart by the all-candidates fetch set, which holds only
-            # while the collector does not escalate on its own — and here it
-            # does, because the account we are on is unreadable. So the gate
-            # would already see `fresh`, the drain would never be forced, and
-            # phase 2 would never run at all (measured: the branch under test
-            # was not reached even once).
+            # phases apart by the all-candidates fetch set, and the collector
+            # asks for exactly that set on its own whenever the active
+            # account's headroom is unreadable — which is this tick's whole
+            # premise, since that is what makes it a failover. The gate would
+            # then already see `fresh`, the drain would never be forced, and
+            # phase 2 would never run (measured: the branch under test was
+            # not reached even once).
             #
             # Order tells them apart instead: the pre-gate escalation comes
             # first, the phase-2 refetch second.

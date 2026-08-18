@@ -90,7 +90,7 @@ cswap auto --threshold 80      # switch earlier
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
-cswap auto --drain-account work                # always come back to this account once it resets
+cswap auto --drain-account work       # spend this one first, come back when it resets
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
 ```
 
@@ -261,7 +261,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
-cswap config set autoswitch.drainAccount work      # prefer this account; return to it once it resets
+cswap config set autoswitch.drainAccount work  # spend it first; return once it resets
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
