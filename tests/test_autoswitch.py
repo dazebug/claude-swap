@@ -7341,3 +7341,56 @@ class TestHomeReturnRefusesWhatItCannotTrust:
 
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+
+class TestHomeReturnHonoursTheModelWindow:
+    """`autoswitch.model` must gate the return, not just the departure.
+
+    Home reads its headroom from the same `_headroom_by_account` the rest of
+    the engine uses, so folding a per-model weekly window in should apply for
+    free. "For free" is exactly the kind of inherited property that breaks
+    silently later, and it is the live configuration here: an account whose
+    5h and 7d have room while its Fable weekly window is spent is a normal
+    state, not a corner case.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, home="2", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_home_whose_model_window_is_spent_is_not_returned_to(self, temp_home):
+        h = self._harness(temp_home, model="Fable")
+
+        outcome = h.tick_with_usage({
+            "1": _model_usage(20, 20),
+            "2": _model_usage(5, 95),   # 5h/7d wide open, Fable spent
+        })
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "returned to a home whose Fable weekly window is at 95%: the "
+            "5h/7d headroom says it is fine, but the model the user actually "
+            "works in is blocked there"
+        )
+        assert h.active_number() == 1
+
+    def test_the_same_home_is_returned_to_when_the_model_is_not_watched(
+        self, temp_home
+    ):
+        """The differential: identical usage, `model` unset -> the return fires.
+
+        Without this pair the test above would also pass if home-return were
+        broken in some unrelated way, and it would not show that `model` is
+        what made the difference.
+        """
+        h = self._harness(temp_home)  # model unset
+
+        outcome = h.tick_with_usage({
+            "1": _model_usage(20, 20),
+            "2": _model_usage(5, 95),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
