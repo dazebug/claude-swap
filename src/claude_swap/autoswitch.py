@@ -1229,7 +1229,13 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        if drain_num is not None and trigger in ("drain-return", "failover"):
+        # Whether the drain account was hard-selected, rather than ranked.
+        # Everything downstream keys on THIS, not on the trigger string: the
+        # freshness contract belongs to "we bypassed ranking for a named
+        # account", and `failover` reaching the same bypass under its own name
+        # slipped past a trigger-string check once already.
+        drain_forced = drain_num is not None and trigger in ("drain-return", "failover")
+        if drain_forced:
             # A NAMED target, not a ranked one — skip `_rank` entirely so
             # neither the hysteresis margin nor the no-return bar can veto it.
             # Both of those answer "is this a BETTER account?"; drain-return
@@ -1262,7 +1268,7 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if trigger in ("consume-first", "drain-return") and ordered:
+        if (trigger == "consume-first" or drain_forced) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1281,7 +1287,7 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            if trigger == "drain-return":
+            if drain_forced:
                 # Re-ask the same question of the fresh data. The drain
                 # account is a CANDIDATE, so its stored snapshot can be up to
                 # CANDIDATE_MAX_INTERVAL_S old, and a stale-LOW reading is
@@ -1294,7 +1300,30 @@ class AutoSwitchEngine:
                 drain_num = self._drain_account_target(
                     settings, headroom, quarantined, current
                 )
-                if drain_num is None:
+                entry = entries.get(drain_num) if drain_num else None
+                stale = entry is None or not entry.fresh(self.clock())
+                if drain_num is not None and not stale:
+                    ordered = [drain_num]
+                elif trigger == "failover":
+                    # Holding is what `drain-return` does here, and it is right
+                    # for it: staying put is a correct outcome when the active
+                    # account is fine. `failover` fires precisely because it is
+                    # NOT fine — we cannot even read it — so the must-move
+                    # contract outranks the drain order. Drop the hard target
+                    # and let ordinary ranking pick from the fresh data.
+                    drain_forced = False
+                    ordered, any_known, active_reset_ts = _rank(
+                        trigger=trigger,
+                        consume_first=consume_first,
+                        oauth_candidates=oauth_candidates,
+                        usage=usage,
+                        headroom=headroom,
+                        current=current,
+                        active_headroom=active_headroom,
+                        settings=settings,
+                        now=decided_now,
+                    )
+                elif drain_num is None:
                     self._emit(
                         NoSwitchEvent(
                             reason="drain-unavailable",
@@ -1305,7 +1334,14 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                ordered = [drain_num]
+                else:
+                    # Still qualifies, but the refetch could not refresh it
+                    # (failure backoff, or a concurrent poller holding the
+                    # claim). That is a different fact from "no longer under
+                    # the threshold" and must not borrow its message — leave
+                    # it to the commit loop's `stale-usage` gate, which says
+                    # so and retries next tick.
+                    ordered = [drain_num]
             else:
                 ordered, any_known, active_reset_ts = _rank(
                     trigger=trigger,
@@ -1415,7 +1451,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger in ("consume-first", "drain-return"):
+            if trigger == "consume-first" or drain_forced:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first

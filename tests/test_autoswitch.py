@@ -7515,3 +7515,55 @@ class TestDrainReturnOutranksTheOverflowAccountsState:
             "relabelling it would rewrite `leftTrigger` and mislead the "
             "anti-flap release legs that a failover departure is owed"
         )
+
+    def test_a_failover_landing_on_a_stale_drain_row_is_verified_first(
+        self, temp_home
+    ):
+        """The hard target must not skip the freshness check failover rides past.
+
+        The two-phase refetch is keyed on the trigger string, so routing
+        `failover` through the same hard target quietly reintroduced exactly
+        the staleness hole this PR closed for `drain-return`: a drain row read
+        minutes ago can say 20% while the account has since been burned to 99%
+        from another machine, and we land on a spent account and leave again
+        next tick.
+
+        Holding is not the answer here the way it is for `drain-return` --
+        failover fires precisely because staying put is not an option. It has
+        to fall back to a fresh ordinary candidate instead.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        now = h.clock.now
+        stale = UsageEntry(
+            last_good=_usage7(20, 20), fetched_at=now - 240.0, age_s=240.0
+        )
+        outcome = h.tick_with_entries({
+            "1": stale,                                   # drain, but not fresh
+            "2": _entry_for(None, now),                   # unreadable -> failover
+            "3": _entry_for(_usage7(0, 0), now),          # fresh peer
+        })
+
+        assert outcome is TickOutcome.SWITCHED, (
+            "failover must still move — holding on an unreadable account is "
+            "the one thing this trigger exists to prevent"
+        )
+        assert h.active_number() == 3, (
+            "landed on the drain account from a 240s-old row without "
+            "re-verifying it; a stale-low reading is indistinguishable from "
+            "a reset that never happened"
+        )
