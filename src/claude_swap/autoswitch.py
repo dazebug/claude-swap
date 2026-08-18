@@ -973,12 +973,26 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # Resolved in the gate below, read again at ranking time. Hoisted so
+        # the ranking bypass sees it on every path through the gate.
+        home_num: str | None = None
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                home_num = self._home_return_target(
+                    settings, headroom, quarantined, current
+                )
+                if home_num is not None:
+                    # Home's window is back under the threshold. Go home
+                    # regardless of strategy: `home` answers "which account do
+                    # I prefer", `strategy` answers "how do I pick a target
+                    # when leaving" — different questions, so this composes
+                    # with best and consume-first instead of competing for the
+                    # one strategy slot.
+                    trigger = "home-return"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -991,11 +1005,12 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively move
+                    # to whichever account's weekly window resets soonest, to burn
+                    # the most-perishable quota first. Candidate selection decides
+                    # whether a sooner-resetting account with room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1046,7 +1061,10 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if (
+            trigger in ("proactive", "consume-first", "home-return")
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1174,17 +1192,28 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        if trigger == "home-return":
+            # A NAMED target, not a ranked one — skip `_rank` entirely so
+            # neither the hysteresis margin nor the no-return bar can veto it.
+            # Both of those answer "is this a BETTER account?"; home-return
+            # asks "is home usable yet?", which the gate already answered
+            # against this same headroom snapshot. Ranking here would strand
+            # the user on an away account that merely has more headroom — the
+            # normal case right after a reset, and the whole point of naming
+            # an account in the first place.
+            ordered, any_known, active_reset_ts = [home_num], True, None
+        else:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -1380,6 +1409,57 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _home_return_target(
+        self,
+        settings: AutoSwitchSettings,
+        headroom: dict[str, float | None],
+        quarantined: set[str],
+        current: str,
+    ) -> str | None:
+        """The home account, when it is both configured and usable again.
+
+        Returns None unless every condition holds, so a caller that gets None
+        falls through to today's below-threshold behaviour untouched:
+
+        - ``autoswitch.home`` resolves to a switchable, non-quarantined
+          account. A DISABLED home stays out on purpose:
+          ``switchable_account_numbers`` already honours ``cswap disable``,
+          and disabling is the user's own "leave this one alone" — it must
+          outrank a home set earlier and forgotten.
+        - it is not where we already are.
+        - its binding window is READABLE and under the threshold. Unknown
+          headroom is not "probably fine": landing on an account we cannot
+          measure would re-trigger blind on the next tick, which is the same
+          harm the landing gate in ``_rank_candidates`` exists to prevent.
+
+        WHY THIS CANNOT FLAP, despite bypassing the anti-flap gates. The
+        engine leaves home only at/above the threshold and returns only
+        strictly below it, so departure and return are disjoint conditions,
+        not two sides of a margin. Home's utilization rises monotonically
+        while it is active and cannot fall while it is not — the only thing
+        that moves it back down is a window reset, which is precisely the
+        event this feature exists to catch. That is a different shape from
+        the pair-relative gates ``_no_return_account`` guards, where burn
+        re-opens a move repeatedly and ``[1, 2, 1, 2]`` is reachable.
+        """
+        if not settings.home:
+            return None
+        try:
+            num = self.switcher._resolve_account_identifier(settings.home)
+        except ClaudeSwitchError:
+            # Unresolvable or ambiguous (e.g. two slots sharing an email).
+            # Never guess which slot the user meant — hold and let the
+            # below-threshold path answer as it does today.
+            return None
+        if num is None or num == current or num in quarantined:
+            return None
+        if num not in self.switcher.switchable_account_numbers():
+            return None
+        h = headroom.get(num)
+        if h is None or (100.0 - h) >= settings.threshold:
+            return None
+        return num
 
     def _no_return_account(
         self,
@@ -2124,7 +2204,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first", "home-return")
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

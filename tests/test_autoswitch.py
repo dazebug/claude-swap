@@ -6894,3 +6894,109 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestHomeAccount:
+    """`autoswitch.home` — a user-named account the engine returns to.
+
+    The engine already leaves an account that hits the threshold. What it has
+    never done is come BACK: the tick gate returns NO_ACTION for every
+    strategy but consume-first once the active account sits below the
+    threshold, so an account the user prefers is left behind permanently
+    after one departure, even when its window has since reset.
+
+    `consume-first` does not cover this: its anchor is "whichever weekly
+    window resets soonest", chosen from the data. `home` is chosen by the
+    user and does not move.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _leave_home(self, h: EngineHarness) -> None:
+        """Burn home past the threshold so the ENGINE moves off it itself.
+
+        Going through a real departure is the point: it arms `lastSwitchTo`
+        and with it the `_no_return_account` bar (PR #202, "NEVER UNDO THE
+        PREVIOUS MOVE"). A test that merely starts the engine on the away
+        account would pass without ever touching the gate that actually
+        blocks this feature.
+        """
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)  # clear the proactive cooldown (default 300s)
+        h.events.clear()
+
+    def test_returns_home_once_home_is_back_under_the_threshold(self, temp_home):
+        """The whole feature: home's window reset, so go back to home."""
+        h = self._harness(temp_home, home="1")
+        self._leave_home(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10),   # home recovered
+            "2": _usage7(20, 20),   # away is fine too -- irrelevant
+        })
+
+        assert outcome is TickOutcome.SWITCHED, (
+            "home recovered and the engine is parked on the away account; "
+            "today the tick gate answers below-threshold NO_ACTION and the "
+            "user never gets back to the account they chose"
+        )
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "home-return"
+
+    def test_stays_away_while_home_is_still_over_the_threshold(self, temp_home):
+        """Not a magnet: home has to actually be usable before we go back."""
+        h = self._harness(temp_home, home="1")
+        self._leave_home(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),   # home still spent
+            "2": _usage7(20, 20),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_home_return_ignores_hysteresis(self, temp_home):
+        """`hysteresis_pct` must not gate the return.
+
+        Hysteresis exists to stop two accounts trading places while both
+        hover near the line -- it asks "is the target BETTER?". Home-return
+        does not ask that question: the target is named, not ranked. Gating
+        it here would strand the user on an away account that merely happens
+        to have more headroom, which is the normal case after a return.
+        """
+        h = self._harness(temp_home, home="1", hysteresis_pct=10.0)
+        self._leave_home(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(80, 20),   # home usable, but WORSE than away
+            "2": _usage7(5, 5),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_unset_home_leaves_todays_behaviour_untouched(self, temp_home):
+        """Regression guard: the default must change nothing."""
+        h = self._harness(temp_home)  # home unset
+        self._leave_home(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10),
+            "2": _usage7(20, 20),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]

@@ -57,6 +57,18 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Account identifier (alias, slot number, or email) the engine treats as
+    # home: it returns there as soon as home's binding window is back under
+    # ``threshold``. No strategy does that today -- the tick gate answers
+    # below-threshold NO_ACTION for everything but consume-first, so one
+    # departure strands the user off the account they chose until an
+    # unrelated threshold crossing happens to move them again.
+    #
+    # Orthogonal to ``strategy`` on purpose. "Which account do I prefer" and
+    # "how do I pick a target when leaving" are different questions, so home
+    # composes with best and consume-first alike rather than competing with
+    # them for the one strategy slot. None = no home (default).
+    home: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "home", "home", "string",
+            help="Account to return to once its window is back under the threshold",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
