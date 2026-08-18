@@ -1245,6 +1245,10 @@ class AutoSwitchEngine:
             # normal case right after a reset, and the whole point of naming
             # an account in the first place.
             #
+            # PROVISIONAL. The two-phase block below re-asks the same question
+            # against a refetch and can overturn this pick — reading only this
+            # far would leave you thinking the target is settled here.
+            #
             # `failover` rides this too, but keeps its own trigger name: the
             # trigger records WHY we moved (the active account went
             # unreadable), not where we landed. Relabelling it would rewrite
@@ -1300,10 +1304,29 @@ class AutoSwitchEngine:
                 drain_num = self._drain_account_target(
                     settings, headroom, quarantined, current
                 )
+                # Two separate ways to fail, and the predicate above only
+                # covers one. It re-answers "does this account still qualify?"
+                # — but it answers it from whatever row the store holds, which
+                # the best-effort refetch may have failed to refresh (failure
+                # backoff, or a concurrent poller holding the claim). A row
+                # that qualifies on stale numbers is not evidence, so the age
+                # is checked separately from the verdict.
                 entry = entries.get(drain_num) if drain_num else None
                 stale = entry is None or not entry.fresh(self.clock())
                 if drain_num is not None and not stale:
                     ordered = [drain_num]
+                # ORDER MATTERS, AND NOTHING ENFORCES IT. This arm sits
+                # ahead of the `drain_num is None` one on purpose: both
+                # conditions hold for a failover whose drain account stopped
+                # qualifying on the fresh data, and the other arm HOLDS —
+                # the one thing failover must never do.
+                #
+                # Measured by swapping the two arms: the whole suite still
+                # passes, 283/283. There is no test for "failover + drain no
+                # longer qualifies", so this ordering is the only thing
+                # standing between that path and a silent must-move
+                # violation. Add that case and this paragraph can shrink to
+                # its first sentence.
                 elif trigger == "failover":
                     # Holding is what `drain-return` does here, and it is right
                     # for it: staying put is a correct outcome when the active
