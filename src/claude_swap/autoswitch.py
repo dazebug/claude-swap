@@ -1103,6 +1103,7 @@ class AutoSwitchEngine:
         self._idle_hold_slow = False
         settings = self.settings
         priority_mode = settings.strategy == "priority-consume-first"
+        balanced = settings.strategy == "balanced"
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -1169,7 +1170,6 @@ class AutoSwitchEngine:
             threshold=thresholds[current],
             weekly_threshold=settings.weekly_threshold,
         )
-        balanced = settings.strategy == "balanced"
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1494,6 +1494,53 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
+            if trigger == "balanced":
+                # The gap is a difference of two scores, so the ACTIVE row
+                # must be fresh too, not just the target's (checked in the
+                # commit loop). A cached active reading can predate its own
+                # weekly reset: 80% in the store, 0% in truth, and the whole
+                # "gap" is that stale number.
+                active_entry = entries.get(current)
+                if active_entry is None or not active_entry.fresh(self.clock()):
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="stale-usage",
+                            detail=(
+                                f"account {current} (active) usage could not "
+                                "be refreshed this tick; retrying"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                # The same test the trigger made: each window against its own
+                # line (the 5h threshold, the weekly line, this account's
+                # override), now on the fresh row.
+                fresh_binding = self._binding(
+                    usage.get(current), settings, thresholds[current]
+                )
+                if active_headroom is None or (
+                    fresh_binding.over
+                    if fresh_binding is not None
+                    else (100.0 - active_headroom) >= thresholds[current]
+                ):
+                    # Classified as a below-threshold balancing move on the
+                    # stored snapshot, but the fresh active is at/over its
+                    # lines (or unreadable). That is the proactive /
+                    # at-limit / all-above regime, which has its own landing
+                    # gates and the no-return bar -- and `balanced` carries
+                    # none of them. Decide it next tick under the right
+                    # trigger instead of switching under this one.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reclassify",
+                            detail=(
+                                "fresh usage puts the active account at or "
+                                "over the threshold; deciding next tick "
+                                "under the threshold gates"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -2419,7 +2466,10 @@ class AutoSwitchEngine:
                     _binding_recovery_ts(usage.get(num), self._models, now),
                 )
             elif balanced:
-                # Furthest behind its weekly schedule first (unknown sorts
+                # Healthy landings first -- the at-limit and failover
+                # escapes skip the landing gate above, and a spent 5h window
+                # with the best pace score would only re-trigger next tick.
+                # Then furthest behind its weekly schedule (unknown sorts
                 # last), the preferred account breaks ties, then sequence
                 # order. Every trigger ranks on this axis under `balanced`
                 # while some account is still under its lines: an at-limit
@@ -2427,6 +2477,7 @@ class AutoSwitchEngine:
                 # not the one with the most raw headroom.
                 score = scores.get(num)
                 key = (
+                    1 if over else 0,
                     score if score is not None else float("inf"),
                     0 if num == preferred else 1,
                 )
