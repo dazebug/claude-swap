@@ -381,3 +381,13 @@ class TestBalancedStrategySettings:
             _args(preferred_account="personal"),
         )
         assert merged.preferred_account == "personal"
+
+    def test_non_finite_numbers_fall_back_to_defaults(self, tmp_path: Path):
+        # Python's json loader accepts NaN/Infinity; a NaN margin makes every
+        # comparison false and the engine ping-pongs on fixed inputs.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"preferencePct": NaN, "threshold": Infinity}}'
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.preference_pct == 10.0
+        assert loaded.threshold == AutoSwitchSettings().threshold

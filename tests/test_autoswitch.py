@@ -7035,8 +7035,8 @@ class TestBalancedStrategy:
         assert h.active_number() == 2
         h.events.clear()
         outcome = h.tick_with_usage({
-            "2": _weekly(h, 90, 84),   # +40 (burned hard)
-            "1": _weekly(h, 60, 84),   # +10: gap 30, but inside the cooldown
+            "2": _weekly(h, 80, 84),   # +30 (burned hard, still under the threshold)
+            "1": _weekly(h, 60, 84),   # +10: gap 20, but inside the cooldown
             "3": _weekly(h, 45, 84),
         })
         assert outcome is TickOutcome.NO_ACTION
@@ -7100,3 +7100,117 @@ class TestBalancedStrategy:
         assert {"1", "2", "3"} in fetch_sets, "no phase-2 refetch happened"
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
+
+    def test_at_limit_prefers_a_healthy_landing_over_a_better_score(self, temp_home):
+        # #2 is furthest behind its weekly pace but its 5h window is spent;
+        # landing there re-triggers next tick. The healthy #3 must win.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 100, 84),
+            "2": _weekly(h, 20, 84, pct5=99),   # −30, but at the 5h limit
+            "3": _weekly(h, 50, 84),            # 0, healthy
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_exact_margin_qualifies_and_one_point_short_holds(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _weekly(h, 60, 84),   # +10
+            "2": _weekly(h, 46, 84),   # −4: gap 14
+            "3": _weekly(h, 55, 84),
+        }) is TickOutcome.NO_ACTION
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _weekly(h, 60, 84),   # +10
+            "2": _weekly(h, 45, 84),   # −5: gap 15 == margin
+            "3": _weekly(h, 55, 84),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_phase_two_reranks_on_fresh_usage(self, temp_home):
+        # Stored: #2 is the pick. Fresh: #2 caught up and #3 fell behind.
+        h = self._harness(temp_home)
+        stored = {
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 20, 84),
+            "3": _weekly(h, 45, 84),
+        }
+        fresh = {
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 45, 84),
+            "3": _weekly(h, 20, 84),
+        }
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
+        assert {"1", "2", "3"} in fetch_sets
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_defers_when_fresh_usage_puts_the_active_at_the_threshold(self, temp_home):
+        # Classified `balanced` on a stale 60%; fresh data says everyone is
+        # at/over the threshold. That regime has its own gates and the
+        # no-return bar, so it is decided on the next tick, not here.
+        h = self._harness(temp_home)
+        stored = {
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 20, 84),
+            "3": _weekly(h, 55, 84),
+        }
+        fresh = {
+            "1": _weekly(h, 98, 84),
+            "2": _weekly(h, 96, 84),
+            "3": _weekly(h, 97, 84),
+        }
+        outcome, _ = _two_phase_tick(h, stored, fresh)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert "reclassify" in _reasons(h)
+
+    def _stale_phase_two_tick(
+        self, h: EngineHarness, view: dict, stale_num: str, age_s: float = 240.0
+    ) -> TickOutcome:
+        """Like `_two_phase_tick`, but ``stale_num``'s phase-2 row could not
+        be refreshed: aged between SERVE_TTL_S and STALE_OK_S, so it still
+        carries a decision value while no longer being fresh."""
+
+        def collect(fetch=None, **_kwargs):
+            requested = set(fetch or ())
+            entries = {
+                num: _entry_for(value, h.clock.now) for num, value in view.items()
+            }
+            if requested == {"1", "2", "3"}:
+                entries[stale_num] = UsageEntry(
+                    last_good=view[stale_num],
+                    fetched_at=h.clock.now - age_s,
+                    age_s=age_s,
+                )
+            return entries
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            return h.engine.tick()
+
+    def test_a_stale_target_row_holds(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = self._stale_phase_two_tick(h, {
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 20, 84),
+            "3": _weekly(h, 55, 84),
+        }, "2")
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "stale-usage" in _reasons(h)
+
+    def test_a_stale_active_row_holds(self, temp_home):
+        # The active's cached 80% may predate its own reset; a move that is
+        # justified only by that number is not a balancing move.
+        h = self._harness(temp_home)
+        outcome = self._stale_phase_two_tick(h, {
+            "1": _weekly(h, 80, 84),
+            "2": _weekly(h, 40, 84),
+            "3": _weekly(h, 55, 84),
+        }, "1")
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "stale-usage" in _reasons(h)

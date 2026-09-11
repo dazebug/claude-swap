@@ -927,6 +927,7 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        balanced = settings.strategy == "balanced"
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -970,7 +971,6 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
-        balanced = settings.strategy == "balanced"
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1259,6 +1259,46 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
+            if trigger == "balanced":
+                # The gap is a difference of two scores, so the ACTIVE row
+                # must be fresh too, not just the target's (checked in the
+                # commit loop). A cached active reading can predate its own
+                # weekly reset: 80% in the store, 0% in truth, and the whole
+                # "gap" is that stale number.
+                active_entry = entries.get(current)
+                if active_entry is None or not active_entry.fresh(self.clock()):
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="stale-usage",
+                            detail=(
+                                f"account {current} (active) usage could not "
+                                "be refreshed this tick; retrying"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                if (
+                    active_headroom is None
+                    or (100.0 - active_headroom) >= settings.threshold
+                ):
+                    # Classified as a below-threshold balancing move on the
+                    # stored snapshot, but the fresh active is at/over the
+                    # threshold (or unreadable). That is the proactive /
+                    # at-limit / all-above regime, which has its own landing
+                    # gates and the no-return bar -- and `balanced` carries
+                    # none of them. Decide it next tick under the right
+                    # trigger instead of switching under this one.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reclassify",
+                            detail=(
+                                "fresh usage puts the active account at or "
+                                "over the threshold; deciding next tick "
+                                "under the threshold gates"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -2074,13 +2114,17 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif balanced:
-                # Furthest behind its weekly schedule first (unknown sorts
+                # Healthy landings first -- the at-limit and failover
+                # escapes skip the landing gate above, and a spent 5h window
+                # with the best pace score would only re-trigger next tick.
+                # Then furthest behind its weekly schedule (unknown sorts
                 # last), the preferred account breaks ties, then sequence
                 # order. Every trigger ranks on this axis under `balanced`:
                 # an at-limit escape lands on the account with the most
                 # schedule left, not the one with the most raw headroom.
                 score = scores.get(num)
                 key = (
+                    0 if (100.0 - h) < settings.threshold else 1,
                     score if score is not None else float("inf"),
                     0 if num == preferred else 1,
                 )

@@ -12,6 +12,7 @@ warning, never a crash — so a bad hand edit degrades to default behavior.
 from __future__ import annotations
 
 import dataclasses
+import math
 import json
 import logging
 import os
@@ -189,6 +190,10 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        if not math.isfinite(value):
+            # json.load accepts NaN/Infinity. A NaN margin makes every gap
+            # comparison false and the engine ping-pongs on fixed inputs.
             return default
         return float(min(max(value, lo), hi))
 
