@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, pace, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
@@ -270,6 +270,10 @@ class PollEvent(AutoSwitchEvent):
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
+    # account number → weekly pace deviation in pct points (used − expected;
+    # positive = ahead of schedule). Emitted by ``strategy: balanced`` only,
+    # since that is the number its decisions are made on. Additive field.
+    pace: dict[str, float | None] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -283,15 +287,22 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.weekly_threshold is not None:
             fields["weeklyThreshold"] = self.weekly_threshold
+        if self.pace:
+            fields["paceDeviationPct"] = self.pace
         return fields
+
+    def _pace_tag(self, num: str) -> str:
+        d = self.pace.get(num)
+        return f" · pace {d:+.1f}" if d is not None else ""
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            joined = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            return joined + self._pace_tag(num)
         h = self.headroom.get(num)
         if h is not None:
-            return f"{100 - h:.0f}%"
+            return f"{100 - h:.0f}%" + self._pace_tag(num)
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
@@ -312,10 +323,13 @@ class PollEvent(AutoSwitchEvent):
                 self.threshold,
                 self.weekly_threshold,
             )
-            used = f"{binding.label} {binding.pct:.0f}% used"
+            used = (
+                f"{binding.label} {binding.pct:.0f}% used"
+                f"{self._pace_tag(str(num))}"
+            )
             line = binding.line
         elif h is not None:
-            used = f"{100 - h:.0f}% used"
+            used = f"{100 - h:.0f}% used{self._pace_tag(str(num))}"
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -334,7 +348,8 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
+    # "proactive" | "at-limit" | "failover" | "consume-first" | "priority" | "balanced"
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -651,6 +666,28 @@ def _headroom_by_account(
         )
         for num, value in usage.items()
     }
+
+
+def _pace_deviation(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float | None:
+    """The ``balanced`` strategy's raw score for one account: how far its
+    weekly windows are ahead of their own schedule, in percentage points.
+
+    ``max`` over the 7d window and every tracked per-model window of
+    ``used% − expected%`` (:func:`pace.deviation_pct`): model work debits
+    both, and the window further ahead is the one that binds first. The 5h
+    window is excluded — it recycles too fast to schedule around — but still
+    gates eligibility through ``account_headroom``. None when no weekly
+    window is readable: unknown, never "on schedule".
+    """
+    scores = [
+        d
+        for label, pct, resets_at in oauth.relevant_windows(usage, models)
+        if label != "5h"
+        and (d := pace.deviation_pct(pct, resets_at, at=now)) is not None
+    ]
+    return max(scores) if scores else None
 
 
 class AutoSwitchEngine:
@@ -1132,6 +1169,7 @@ class AutoSwitchEngine:
             threshold=thresholds[current],
             weekly_threshold=settings.weekly_threshold,
         )
+        balanced = settings.strategy == "balanced"
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1141,6 +1179,15 @@ class AutoSwitchEngine:
                 # gate below actually used, or the UI contradicts the engine.
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
+                pace=(
+                    {
+                        num: _pace_deviation(value, self._models, self.clock())
+                        for num, value in usage.items()
+                        if isinstance(value, dict)
+                    }
+                    if balanced
+                    else {}
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1188,7 +1235,10 @@ class AutoSwitchEngine:
                 else (100.0 - active_headroom) < thresholds[current]
             )
             if below:
-                if settings.strategy != "consume-first" and not priority_mode:
+                if (
+                    settings.strategy not in ("consume-first", "balanced")
+                    and not priority_mode
+                ):
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1202,11 +1252,19 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "priority" if priority_mode else "consume-first"
+                if balanced:
+                    # balanced: below the threshold we still move, to whichever
+                    # account is furthest behind its own weekly schedule -- but
+                    # only once the active account is ahead of it by the
+                    # hysteresis margin. `_rank_candidates` applies both.
+                    trigger = "balanced"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account with
+                    # room actually exists.
+                    trigger = "priority" if priority_mode else "consume-first"
             else:
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
@@ -1258,7 +1316,10 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+        if (
+            trigger in ("proactive", "consume-first", "priority", "balanced")
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1282,7 +1343,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger in ("consume-first", "priority")
+            trigger in ("consume-first", "priority", "balanced")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1414,7 +1475,7 @@ class AutoSwitchEngine:
             thresholds=thresholds,
         )
 
-        if (trigger == "consume-first" or priority_mode) and ordered:
+        if (trigger in ("consume-first", "balanced") or priority_mode) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1451,7 +1512,7 @@ class AutoSwitchEngine:
         )
         if (
             not ordered and api_key_candidates
-            and trigger not in ("consume-first", "priority")
+            and trigger not in ("consume-first", "priority", "balanced")
             and not priority_active_ready
         ):
             # Last resort when we must move: metered API-key accounts
@@ -1482,6 +1543,26 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "balanced":
+                # Below the threshold and healthy: staying put is the normal
+                # outcome. Say where everyone stands so the strategy can be
+                # seen working (or holding) from the log alone.
+                scores = self._balanced_scores(usage, settings, decided_now)
+                standing = ", ".join(
+                    f"#{num} " + ("?" if d is None else f"{d:+.1f}")
+                    for num, d in sorted(scores.items(), key=lambda kv: int(kv[0]))
+                )
+                self._emit(
+                    NoSwitchEvent(
+                        reason="balanced-hold",
+                        detail=(
+                            "no healthy account is behind the active one's "
+                            f"weekly pace by >= {pct_label(settings.hysteresis_pct)} "
+                            f"pp (pace: {standing})"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1568,7 +1649,9 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first" or (priority_mode and num in oauth_candidates):
+            if trigger in ("consume-first", "balanced") or (
+                priority_mode and num in oauth_candidates
+            ):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1640,6 +1723,43 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _resolved_preferred_account(
+        self, settings: AutoSwitchSettings
+    ) -> str | None:
+        """``autoswitch.preferredAccount`` as an account number, or None if
+        unset, unresolvable or ambiguous (e.g. two slots sharing an email:
+        never guess which slot the user meant)."""
+        if not settings.preferred_account:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(
+                settings.preferred_account
+            )
+        except ClaudeSwitchError:
+            return None
+
+    def _balanced_scores(
+        self,
+        usage: dict[str, dict | str | None],
+        settings: AutoSwitchSettings,
+        now: float,
+    ) -> dict[str, float | None]:
+        """Adjusted pace score per account for ``strategy: balanced``.
+
+        The raw deviation (`_pace_deviation`), minus ``preference_pct`` for
+        the preferred account: it wins near-ties and keeps the work until it
+        is ahead of its schedule by more than the bias plus the hysteresis
+        margin. Lower is the better place to be. None = unknown.
+        """
+        preferred = self._resolved_preferred_account(settings)
+        scores: dict[str, float | None] = {}
+        for num, value in usage.items():
+            d = _pace_deviation(value, self._models, now)
+            if d is not None and num == preferred:
+                d -= settings.preference_pct
+            scores[num] = d
+        return scores
 
     def _no_return_account(
         self,
@@ -2130,6 +2250,13 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # balanced ranks by adjusted pace score (lower = further behind its
+        # own weekly schedule = the better place to send work). Scored from
+        # THIS snapshot, so the phase-2 re-rank sees fresh numbers.
+        balanced = settings.strategy == "balanced"
+        scores = self._balanced_scores(usage, settings, now) if balanced else {}
+        active_score = scores.get(current) if balanced else None
+        preferred = self._resolved_preferred_account(settings) if balanced else None
         # One binding window per account under THIS snapshot's lines — the
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
         # trigger computed is reused here.
@@ -2223,7 +2350,7 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "balanced"):
                 # Landing must be healthy: an account at/over any of its own
                 # lines would re-trigger on the very next tick. At-limit and
                 # failover are escapes that skip this whole block — any account
@@ -2234,14 +2361,29 @@ class AutoSwitchEngine:
                     # Checked before the strategies, because with nothing under
                     # its lines the strategy question is moot: consume-first
                     # exists to spend perishable WEEKLY quota, and every account
-                    # here is about to be blocked on a window. Both strategies
-                    # want the account with the most room, so both take this
+                    # here is about to be blocked on a window. Every strategy
+                    # wants the account with the most room, so all take this
                     # gate and the matching key below. (Ordering matters: `if
                     # consume_first` catching first filtered on weekly ordering
                     # while the key sorted on room, two different axes, and
                     # left consume-first users with no anti-flap guard at all.)
                     if not _all_above_margin_met(h, active_headroom or 0.0):
                         continue
+                elif balanced:
+                    score = scores.get(num)
+                    if score is None:
+                        continue  # no weekly window readable: cannot be placed
+                    if trigger == "balanced":
+                        # Below the threshold: move only when the active
+                        # account is ahead of this one by the margin. A
+                        # non-positive gap never qualifies, whatever the
+                        # margin, so a zero margin cannot flip on a tie.
+                        gap = None if active_score is None else active_score - score
+                        if gap is None or gap <= 0.0 or gap < settings.hysteresis_pct:
+                            continue
+                    # At/over the threshold (proactive): any healthy account
+                    # beats the one we are leaving; the sort below still
+                    # sends us to the one furthest behind its schedule.
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
@@ -2275,6 +2417,18 @@ class AutoSwitchEngine:
                 key: tuple = (
                     -h,
                     _binding_recovery_ts(usage.get(num), self._models, now),
+                )
+            elif balanced:
+                # Furthest behind its weekly schedule first (unknown sorts
+                # last), the preferred account breaks ties, then sequence
+                # order. Every trigger ranks on this axis under `balanced`
+                # while some account is still under its lines: an at-limit
+                # escape lands on the account with the most schedule left,
+                # not the one with the most raw headroom.
+                score = scores.get(num)
+                key = (
+                    score if score is not None else float("inf"),
+                    0 if num == preferred else 1,
                 )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
@@ -2473,7 +2627,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first", "priority", "balanced")
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

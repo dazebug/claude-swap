@@ -491,3 +491,29 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+class TestBalancedStrategySettings:
+    def test_balanced_is_a_valid_strategy(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "balanced")
+        assert load_settings(tmp_path).strategy == "balanced"
+
+    def test_preferred_account_and_preference_pct_round_trip(self, tmp_path: Path):
+        assert AutoSwitchSettings().preferred_account is None
+        assert AutoSwitchSettings().preference_pct == 10.0
+        set_setting(tmp_path, "autoswitch.preferredAccount", "watcha")
+        set_setting(tmp_path, "autoswitch.preferencePct", "25")
+        loaded = load_settings(tmp_path)
+        assert loaded.preferred_account == "watcha"
+        assert loaded.preference_pct == 25.0
+
+    def test_preference_pct_out_of_range_is_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between"):
+            set_setting(tmp_path, "autoswitch.preferencePct", "150")
+
+    def test_preferred_account_cli_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(preferred_account="work"),
+            _args(preferred_account="personal"),
+        )
+        assert merged.preferred_account == "personal"
