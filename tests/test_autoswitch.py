@@ -2782,6 +2782,35 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def _two_phase_tick(
+    h: EngineHarness, stored: dict, fresh: dict
+) -> tuple[TickOutcome, list[set]]:
+    """Drive one tick where stored-snapshot collections serve ``stored``
+    and the all-candidates escalation serves ``fresh``.
+
+    These ticks run outside the escalation band (utilization far below
+    threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
+    on its own and the only all-candidates call a tick can make is the
+    phase-2 refetch — the returned fetch sets prove whether it happened.
+
+    Shared by both refetching strategies (consume-first and balanced) so
+    that fetch set cannot drift in one copy: a set that stops matching does
+    not fail, it serves ``stored`` to phase 2 and the test passes without
+    exercising the verification it is named after.
+    """
+    fetch_sets: list[set] = []
+
+    def collect(fetch=None, **_kwargs):
+        requested = set(fetch or ())
+        fetch_sets.append(requested)
+        view = fresh if requested == {"1", "2", "3"} else stored
+        return {num: _entry_for(value, h.clock.now) for num, value in view.items()}
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+        outcome = h.engine.tick()
+    return outcome, fetch_sets
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -3067,35 +3096,6 @@ class TestConsumeFirstStrategy:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["reset-unknown"]
 
-    def _two_phase_tick(
-        self, h: EngineHarness, stored: dict, fresh: dict
-    ) -> tuple[TickOutcome, list[set]]:
-        """Drive one tick where stored-snapshot collections serve ``stored``
-        and the all-candidates escalation serves ``fresh``.
-
-        These ticks run outside the escalation band (utilization far below
-        threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
-        on its own and the only all-candidates call a tick can make is the
-        consume-first phase-2 refetch — the returned fetch sets prove whether
-        it happened.
-        """
-        fetch_sets: list[set] = []
-
-        def collect(fetch=None, **_kwargs):
-            requested = set(fetch or ())
-            fetch_sets.append(requested)
-            view = fresh if requested == {"1", "2", "3"} else stored
-            return {
-                num: _entry_for(value, h.clock.now)
-                for num, value in view.items()
-            }
-
-        with patch.object(
-            h.switcher, "usage_entries_by_account", side_effect=collect
-        ):
-            outcome = h.engine.tick()
-        return outcome, fetch_sets
-
     def test_two_phase_refetch_disqualifies_stale_pick(self, temp_home):
         # The stored snapshot ranks #2; the phase-2 refetch shows it
         # exhausted. The tick must re-decide on the fresh data and hold.
@@ -3110,7 +3110,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(100, 100, _R_SOON),   # burned out since the snapshot
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -3126,7 +3126,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, view, view)
+        outcome, fetch_sets = _two_phase_tick(h, view, view)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert {"1", "2", "3"} in fetch_sets
@@ -3146,7 +3146,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_LATER),    # still sooner than active
             "3": _usage7(10, 10, _R_SOON),     # but #3 is now soonest
         }
-        outcome, _ = self._two_phase_tick(h, stored, fresh)
+        outcome, _ = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
@@ -3168,7 +3168,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_LATEST),   # no longer strictly sooner
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
@@ -6894,3 +6894,209 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+# ---------------------------------------------------------------------------
+# balanced strategy
+# ---------------------------------------------------------------------------
+
+_HOUR = 3600.0
+
+
+def _weekly(
+    h: EngineHarness,
+    pct7: float,
+    hours_to_reset: float | None,
+    *,
+    fable: float | None = None,
+    pct5: float = 0.0,
+) -> dict:
+    """Usage whose weekly windows reset ``hours_to_reset`` from the harness
+    clock (None = no ``resets_at`` reported). ``fable`` adds a scoped Fable
+    window on the same reset. Expected pace at 84h to reset is 50%."""
+    reset = (
+        _iso_at(h.clock.now + hours_to_reset * _HOUR)
+        if hours_to_reset is not None
+        else None
+    )
+    seven: dict = {"pct": pct7}
+    if reset:
+        seven["resets_at"] = reset
+    usage: dict = {"five_hour": {"pct": pct5}, "seven_day": seven}
+    if fable is not None:
+        scoped: dict = {"name": "Fable", "pct": fable}
+        if reset:
+            scoped["resets_at"] = reset
+        usage["scoped"] = [scoped]
+    return usage
+
+
+def _switches(h: EngineHarness) -> list[SwitchEvent]:
+    return [e for e in h.events if isinstance(e, SwitchEvent)]
+
+
+def _reasons(h: EngineHarness) -> list[str]:
+    return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+
+class TestBalancedStrategy:
+    """``strategy: balanced`` — keep every account's weekly windows on their
+    own schedule. Score = max over weekly windows of (used% − expected%),
+    lower wins; below the threshold the engine moves only when the active
+    account is ahead of the best candidate by ``hysteresis_pct``."""
+
+    def _harness(self, temp_home: Path, live: int = 1, **kw) -> EngineHarness:
+        kw.setdefault("strategy", "balanced")
+        kw.setdefault("hysteresis_pct", 15.0)
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live(f"{'abc'[live - 1]}@example.com", live)
+        if live != 1:
+            # seed() records the first slot as active; the engine reads the
+            # live credential, `active_number()` reads this record.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = live
+            h.switcher._write_json(h.switcher.sequence_file, data)
+        return h
+
+    def test_moves_to_the_account_furthest_behind_its_weekly_pace(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84),   # active: +10
+            "2": _weekly(h, 20, 84),   # −30: furthest behind
+            "3": _weekly(h, 45, 84),   # −5
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _switches(h)[-1].trigger == "balanced"
+
+    def test_holds_inside_the_margin(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84),   # +10
+            "2": _weekly(h, 48, 84),   # −2: gap 12 < 15
+            "3": _weekly(h, 55, 84),   # +5
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "balanced-hold" in _reasons(h)
+
+    def test_the_window_with_the_larger_deviation_binds(self, temp_home):
+        # #2's 7d window is the emptiest, but its Fable window is far ahead
+        # of pace; Fable work debits both, so #2 scores +35, not −30.
+        h = self._harness(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=60),   # +10
+            "2": _weekly(h, 20, 84, fable=85),   # max(−30, +35) = +35
+            "3": _weekly(h, 45, 84, fable=45),   # −5
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_missing_reset_counts_as_no_elapsed_time(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 70, 84),     # +20
+            "2": _weekly(h, 30, None),   # no resets_at: expected 0 -> +30
+            "3": _weekly(h, 45, 84),     # −5
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_preferred_account_attracts_within_its_bias(self, temp_home):
+        h = self._harness(temp_home, preferred_account="2")  # bias 10 (default)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84),   # +10
+            "2": _weekly(h, 48, 84),   # −2 raw, −12 adjusted: gap 22 ≥ 15
+            "3": _weekly(h, 55, 84),   # +5
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_preferred_account_holds_within_its_bias(self, temp_home):
+        h = self._harness(temp_home, live=2, preferred_account="2")
+        outcome = h.tick_with_usage({
+            "2": _weekly(h, 60, 84),   # active, preferred: +10 raw, 0 adjusted
+            "1": _weekly(h, 40, 84),   # −10: gap 10 < 15
+            "3": _weekly(h, 45, 84),   # −5
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_respects_cooldown(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 20, 84),
+            "3": _weekly(h, 45, 84),
+        })
+        assert h.active_number() == 2
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "2": _weekly(h, 90, 84),   # +40 (burned hard)
+            "1": _weekly(h, 60, 84),   # +10: gap 30, but inside the cooldown
+            "3": _weekly(h, 45, 84),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "cooldown" in _reasons(h)
+
+    def test_at_limit_departure_ranks_by_pace_not_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 100, 84),   # at its limit
+            "2": _weekly(h, 40, 160),   # 60 pts headroom, but 8h in: +35
+            "3": _weekly(h, 60, 20),    # 40 pts headroom, 148h in: −28
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert _switches(h)[-1].trigger == "at-limit"
+
+    def test_returns_to_a_left_account_once_pace_flips(self, temp_home):
+        # Rotation is the point: the no-return bar must not pin the engine.
+        h = self._harness(temp_home)
+        h.tick_with_usage({
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 20, 84),
+            "3": _weekly(h, 45, 84),
+        })
+        assert h.active_number() == 2
+        h.clock.advance(24 * _HOUR)
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "2": _weekly(h, 80, 60),   # +15.7
+            "1": _weekly(h, 60, 60),   # −4.3: gap 20 ≥ 15
+            "3": _weekly(h, 70, 60),   # +5.7
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_poll_event_reports_the_pace_scores(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 48, 84),
+            "3": _weekly(h, 55, 84),
+        })
+        poll = [e for e in h.events if isinstance(e, PollEvent)][-1]
+        scores = poll.to_json()["paceDeviationPct"]
+        assert round(scores["1"], 1) == 10.0
+        assert round(scores["2"], 1) == -2.0
+        assert round(scores["3"], 1) == 5.0
+        assert "pace" in poll.human()
+
+    def test_provisional_pick_is_reverified_on_fresh_usage(self, temp_home):
+        # The stored snapshot says #2 is far behind; the refetch says spent.
+        h = self._harness(temp_home)
+        stored = {
+            "1": _weekly(h, 60, 84),
+            "2": _weekly(h, 20, 84),
+            "3": _weekly(h, 55, 84),
+        }
+        fresh = dict(stored, **{"2": _weekly(h, 96, 84)})
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
+        assert {"1", "2", "3"} in fetch_sets, "no phase-2 refetch happened"
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
