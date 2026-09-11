@@ -1293,8 +1293,8 @@ class AutoSwitchEngine:
                             reason="reclassify",
                             detail=(
                                 "fresh usage puts the active account at or "
-                                "over the threshold; deciding next tick "
-                                "under the threshold gates"
+                                "over the threshold, or leaves it unreadable; "
+                                "deciding next tick under the threshold gates"
                             ),
                         )
                     )

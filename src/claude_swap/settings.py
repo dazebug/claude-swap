@@ -191,9 +191,11 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return default
-        if not math.isfinite(value):
+        if isinstance(value, float) and not math.isfinite(value):
             # json.load accepts NaN/Infinity. A NaN margin makes every gap
             # comparison false and the engine ping-pongs on fixed inputs.
+            # Floats only: an arbitrary-precision JSON int overflows
+            # isfinite(), and the clamp below handles it exactly.
             return default
         return float(min(max(value, lo), hi))
 

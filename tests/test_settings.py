@@ -391,3 +391,11 @@ class TestBalancedStrategySettings:
         loaded = load_settings(tmp_path)
         assert loaded.preference_pct == 10.0
         assert loaded.threshold == AutoSwitchSettings().threshold
+
+    def test_huge_integer_clamps_instead_of_overflowing(self, tmp_path: Path):
+        # json.load yields an arbitrary-precision int; math.isfinite() raises
+        # OverflowError on it. Clamp it like any other out-of-range number.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"preferencePct": 1' + "0" * 400 + "}}"
+        )
+        assert load_settings(tmp_path).preference_pct == 100.0
