@@ -7363,24 +7363,46 @@ class TestBalancedModelFallback:
         assert h.tick_with_usage(second) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_a_read_failure_does_not_flip_the_bar(self, temp_home):
+    @pytest.mark.parametrize("cause", ["timeout", "missing-model", "membership"])
+    @pytest.mark.parametrize("route", ["control", "recovery", "dominance", "at-limit"])
+    def test_the_view_ignores_rows_that_cannot_be_landed_on(
+        self, temp_home, cause, route
+    ):
+        from copy import deepcopy
+
         h = self._harness(temp_home)
-        view = {
-            "1": _weekly(h, 60, 84, fable=96, pct5=0),
-            "2": _weekly(h, 20, 84, fable=99, pct5=0),
+        rows = {
+            "1": _weekly(
+                h, 60, 84, fable=94 if route == "dominance" else 96, pct5=0
+            ),
+            "2": _weekly(
+                h, 20, 84, fable=100 if route == "at-limit" else 99, pct5=0
+            ),
             "3": _weekly(h, 100, 84, fable=99, pct5=0),
         }
+        if route == "recovery":
+            rows["1"]["scoped"][0]["resets_at"] = _iso_at(
+                h.clock.now + 24 * _HOUR
+            )
+        if cause == "membership" and route != "control":
+            rows["3"]["scoped"] = []
+
         moves = []
         trace = []
         for tick in range(6):
             h.clock.advance(4000)
             now = h.clock.now
+            if cause == "membership" and route != "control":
+                data = h.switcher._get_sequence_data()
+                data["accounts"]["3"]["disabled"] = tick % 2 == 0
+                h.switcher._write_json(h.switcher.sequence_file, data)
+            tick_rows = deepcopy(rows)
             entries = {
-                num: _entry_for(value, now) for num, value in view.items()
+                num: _entry_for(value, now) for num, value in tick_rows.items()
             }
-            if tick % 2:
+            if cause == "timeout" and route != "control" and tick % 2:
                 entries["3"] = UsageEntry(
-                    last_good=view["3"],
+                    last_good=rows["3"],
                     fetched_at=now - 4000,
                     age_s=4000,
                     last_error="timeout",
@@ -7388,6 +7410,10 @@ class TestBalancedModelFallback:
                     backoff_until=now + 600,
                     trust_extended=False,
                 )
+            elif cause == "missing-model" and route != "control" and tick % 2:
+                tick_rows["3"]["scoped"] = []
+                entries["3"] = _entry_for(tick_rows["3"], now)
+
             before = h.active_number()
             h.events.clear()
             outcome = h.tick_with_entries(entries)
@@ -7397,14 +7423,7 @@ class TestBalancedModelFallback:
             if outcome is TickOutcome.SWITCHED:
                 moves.append((before, after))
 
-        assert trace == [
-            (0, True, 2),
-            (1, False, 2),
-            (2, True, 2),
-            (3, False, 2),
-            (4, True, 2),
-            (5, False, 2),
-        ]
+        assert trace == [(tick, True, 2) for tick in range(6)]
         assert moves == [(1, 2)]
 
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):

@@ -752,48 +752,46 @@ class AutoSwitchEngine:
         oauth_candidates: list[str],
         settings: AutoSwitchSettings,
     ) -> tuple[str, ...]:
-        """The window set this tick decides on: the configured models, or ``()``.
+        """Choose the configured or 5h/7d view from landability.
 
-        ``()`` -- the 5h/7d windows alone -- when the active account and every
-        OAuth candidate report a tracked model window at or over the threshold,
-        and at least one of them is under the threshold on 5h/7d. With the model
-        windows spent everywhere they no longer tell the accounts apart, and
-        deciding on them parks the user on a spent account while another
-        account's weekly quota goes unused. An unreadable row, or an account that
-        reports no tracked model window, keeps the configured set: "spent
-        everywhere" cannot be claimed. Called on the stored snapshot and again on
-        the phase-2 refetch; the caller defers when the two answers differ.
+        The configured model view is eligible for fallback only when the
+        active account reports a tracked model window at or over the threshold.
+        A readable OAuth candidate with room on the configured windows keeps
+        that view, because it is a landable destination without fallback. If
+        neither condition applies, ``()`` is selected when the active account
+        or a readable candidate is landable on 5h/7d. Rows that are unreadable,
+        lack a tracked model window, or cannot be landed on are excluded: their
+        read or membership state must not change the view. Otherwise the two
+        views can make opposite decisions about a spent account and switch
+        back and forth on unchanged usage. An unreadable active keeps the
+        configured view so the failover path is unchanged. Called on the
+        stored snapshot and again on the phase-2 refetch; the caller defers
+        when the two answers differ.
         """
         if not self._models:
             return self._models
-        candidate_accounts = [current, *oauth_candidates]
-        # If any row is unreadable, we cannot claim model blocking is global.
-        for num in candidate_accounts:
-            value = usage.get(num)
-            if not isinstance(value, dict):
-                return self._models
-
-        model_window_pcts: dict[str, list[float]] = {}
-        for num in candidate_accounts:
-            model_window_pcts[num] = _model_window_pcts(usage[num], self._models)
-            if not model_window_pcts[num]:
-                return self._models
-
-        if not all(
-            max(pcts) >= settings.threshold
-            for pcts in model_window_pcts.values()
-        ):
+        active = usage.get(current)
+        if not isinstance(active, dict):
+            return self._models
+        active_model_pcts = _model_window_pcts(active, self._models)
+        if not active_model_pcts or max(active_model_pcts) < settings.threshold:
             return self._models
 
-        model_window_free = False
-        for num in candidate_accounts:
-            headroom = oauth.account_headroom(usage[num], ())
-            if headroom is None:
+        readable_candidates = [
+            value
+            for num in oauth_candidates
+            if isinstance(value := usage.get(num), dict)
+        ]
+        for value in readable_candidates:
+            headroom = oauth.account_headroom(value, self._models)
+            if headroom is not None and (100.0 - headroom) < settings.threshold:
                 return self._models
-            if (100.0 - headroom) < settings.threshold:
-                model_window_free = True
 
-        return () if model_window_free else self._models
+        for value in [active, *readable_candidates]:
+            headroom = oauth.account_headroom(value, ())
+            if headroom is not None and (100.0 - headroom) < settings.threshold:
+                return ()
+        return self._models
 
     # -- state file ---------------------------------------------------------
 
