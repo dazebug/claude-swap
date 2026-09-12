@@ -7231,6 +7231,13 @@ class TestBalancedStrategy:
         assert "stale-usage" in _reasons(h)
 
 
+def _session_owning(number):
+    def pids(account_num, email):
+        return [4242] if number is not None and str(account_num) == str(number) else []
+
+    return pids
+
+
 class TestBalancedModelFallback:
     """`strategy: balanced` fallback to 5h/7d only when no configured-view
     landing is available."""
@@ -7294,43 +7301,27 @@ class TestBalancedModelFallback:
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert "modelFallback" not in poll.to_json()
 
-    def test_returns_to_the_left_account_once_its_model_window_resets(self, temp_home):
+    @pytest.mark.parametrize("weekly, peer_fable", [(60, 97), (89, 95)], ids=["clear-of-the-weekly-threshold", "near-the-weekly-threshold"])
+    def test_returns_to_the_left_account_once_its_model_window_resets(
+        self, temp_home, weekly, peer_fable
+    ):
         h = self._harness(temp_home)
         assert h.tick_with_usage({
-            "1": _weekly(h, 60, 84, fable=96),
-            "2": _weekly(h, 20, 84, fable=97),
+            "1": _weekly(h, weekly, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=peer_fable),
             "3": _weekly(h, 45, 84, fable=99),
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         h.clock.advance(400)
         h.events.clear()
         assert h.tick_with_usage({
-            "1": _weekly(h, 60, 84, fable=0),
-            "2": _weekly(h, 25, 84, fable=97),
+            "1": _weekly(h, weekly, 84, fable=0),
+            "2": _weekly(h, 25, 84, fable=peer_fable),
             "3": _weekly(h, 45, 84, fable=99),
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 1
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert "modelFallback" not in poll.to_json()
-
-    def test_returns_after_a_fallback_departure_even_near_the_weekly_threshold(
-        self, temp_home
-    ):
-        h = self._harness(temp_home)
-        assert h.tick_with_usage({
-            "1": _weekly(h, 89, 84, fable=96),
-            "2": _weekly(h, 20, 84, fable=95),
-            "3": _weekly(h, 45, 84, fable=99),
-        }) is TickOutcome.SWITCHED
-        assert h.active_number() == 2
-        h.clock.advance(400)
-        h.events.clear()
-        assert h.tick_with_usage({
-            "1": _weekly(h, 89, 84, fable=0),
-            "2": _weekly(h, 25, 84, fable=95),
-            "3": _weekly(h, 45, 84, fable=99),
-        }) is TickOutcome.SWITCHED
-        assert h.active_number() == 1
 
     def test_returns_when_the_fallback_view_drops_the_reason_we_left(
         self, temp_home
@@ -7362,6 +7353,44 @@ class TestBalancedModelFallback:
         h.events.clear()
         assert h.tick_with_usage(second) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+    @pytest.mark.parametrize("representation", ["zero", "absent"])
+    def test_returns_to_a_landable_left_account_whether_its_model_window_is_zero_or_unreported(
+        self, temp_home, representation
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        first = {
+            "1": _weekly(h, 89, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=95, pct5=0),
+            "3": _weekly(h, 45, 84, fable=99, pct5=0),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.state()
+        assert state["leftModelFallback"] is True
+        assert state["leftHeadroom"] == 11.0
+
+        moves = []
+        for _ in range(3):
+            h.clock.advance(400)
+            current = deepcopy(first)
+            if representation == "zero":
+                current["1"]["scoped"][0]["pct"] = 0
+            else:
+                current["1"].pop("scoped")
+            before = h.active_number()
+            h.events.clear()
+            outcome = h.tick_with_usage(current)
+            after = h.active_number()
+            poll = next(e for e in h.events if isinstance(e, PollEvent))
+            assert not poll.model_fallback
+            assert after == 1
+            if outcome is TickOutcome.SWITCHED:
+                moves.append((before, after))
+
+        assert moves == [(2, 1)]
 
     @pytest.mark.parametrize("cause", ["timeout", "missing-model", "membership"])
     @pytest.mark.parametrize("route", ["control", "recovery", "dominance", "at-limit"])
@@ -7432,7 +7461,6 @@ class TestBalancedModelFallback:
         self, temp_home, scenario, owned
     ):
         from copy import deepcopy
-        from unittest.mock import patch
 
         h = self._harness(temp_home)
         rows = {
@@ -7441,13 +7469,8 @@ class TestBalancedModelFallback:
             "3": _weekly(h, 0, 84, fable=0, pct5=0),
         }
 
-        def live_session_pids(*args, **kwargs):
-            values = [*args, *kwargs.values()]
-            return [4242] if owned and any(str(value) == "3" for value in values) else []
-
-        with patch.object(
-            h.switcher, "_live_session_pids", side_effect=live_session_pids
-        ):
+        session_pids = _session_owning("3" if owned else None)
+        with patch.object(h.switcher, "_live_session_pids", side_effect=session_pids):
             if scenario == "loop":
                 moves = []
                 trace = []
@@ -7500,18 +7523,12 @@ class TestBalancedModelFallback:
     @pytest.mark.parametrize("owned", [False, True])
     @pytest.mark.parametrize("age", [0, 600])
     def test_an_owned_candidate_is_not_ranked(self, temp_home, owned, age):
-        from unittest.mock import patch
-
         h = self._harness(temp_home)
         rows = {
             "1": _weekly(h, 60, 84, fable=96, pct5=0),
             "2": _weekly(h, 20, 84, fable=100, pct5=0),
             "3": _weekly(h, 0, 84, fable=0, pct5=0),
         }
-
-        def live_session_pids(*args, **kwargs):
-            values = [*args, *kwargs.values()]
-            return [4242] if owned and any(str(value) == "3" for value in values) else []
 
         h.clock.advance(4000)
         now = h.clock.now
@@ -7527,9 +7544,8 @@ class TestBalancedModelFallback:
                 trust_extended=True,
             )
 
-        with patch.object(
-            h.switcher, "_live_session_pids", side_effect=live_session_pids
-        ):
+        session_pids = _session_owning("3" if owned else None)
+        with patch.object(h.switcher, "_live_session_pids", side_effect=session_pids):
             outcome = h.tick_with_entries(entries)
 
         assert outcome is TickOutcome.SWITCHED
@@ -7607,44 +7623,6 @@ class TestBalancedModelFallback:
             assert moves[0] == (1, 2)
             assert len(moves) <= 2
 
-    @pytest.mark.parametrize("representation", ["zero", "absent"])
-    def test_returns_to_a_landable_left_account_whether_its_model_window_is_zero_or_unreported(
-        self, temp_home, representation
-    ):
-        from copy import deepcopy
-
-        h = self._harness(temp_home)
-        first = {
-            "1": _weekly(h, 89, 84, fable=96, pct5=0),
-            "2": _weekly(h, 20, 84, fable=95, pct5=0),
-            "3": _weekly(h, 45, 84, fable=99, pct5=0),
-        }
-        assert h.tick_with_usage(first) is TickOutcome.SWITCHED
-        assert h.active_number() == 2
-        state = h.state()
-        assert state["leftModelFallback"] is True
-        assert state["leftHeadroom"] == 11.0
-
-        moves = []
-        for _ in range(3):
-            h.clock.advance(400)
-            current = deepcopy(first)
-            if representation == "zero":
-                current["1"]["scoped"][0]["pct"] = 0
-            else:
-                current["1"].pop("scoped")
-            before = h.active_number()
-            h.events.clear()
-            outcome = h.tick_with_usage(current)
-            after = h.active_number()
-            poll = next(e for e in h.events if isinstance(e, PollEvent))
-            assert not poll.model_fallback
-            assert after == 1
-            if outcome is TickOutcome.SWITCHED:
-                moves.append((before, after))
-
-        assert moves == [(2, 1)]
-
     def test_the_balanced_hold_lists_only_the_accounts_it_could_choose_from(
         self, temp_home
     ):
@@ -7655,12 +7633,8 @@ class TestBalancedModelFallback:
             "3": _weekly(h, 0, 84, fable=0, pct5=0),
         }
 
-        def live_session_pids(*args, **kwargs):
-            values = [*args, *kwargs.values()]
-            return [4242] if any(str(value) == "3" for value in values) else []
-
         with patch.object(
-            h.switcher, "_live_session_pids", side_effect=live_session_pids
+            h.switcher, "_live_session_pids", side_effect=_session_owning("3")
         ):
             assert h.tick_with_usage(rows) is TickOutcome.NO_ACTION
 
