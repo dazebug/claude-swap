@@ -760,21 +760,26 @@ class AutoSwitchEngine:
 
         The configured view is eligible for fallback only when the active
         account reports a tracked model window at or over the threshold. A
-        readable OAuth candidate that can be landed on in the configured view
-        keeps that view and marks it as shadowed; the caller then limits escape
-        targets to those configured-view landings. If no such configured
-        candidate exists, the active account or a readable candidate that can
-        be landed on in 5h/7d selects ``()``; otherwise the configured tuple
-        remains. The candidate census excludes accounts the commit loop skips,
-        so they cannot decide the view or its ranking. Unreadable candidates,
-        candidates that cannot be landed on in 5h/7d, and membership changes
-        for an unusable account are excluded: otherwise the two views can make
-        opposite decisions about a spent account and switch back and forth on
-        unchanged usage. An unreadable active, or an active without a tracked
-        model window, keeps the configured view so failover and an active that
-        can continue model work are unchanged. Called on the stored snapshot
-        and again on the phase-2 refetch; the caller defers when the answers
-        differ.
+        readable OAuth candidate that the ranking could land on in the
+        configured view -- landable there AND carrying a weekly window to be
+        placed on a schedule, the same two conditions `_rank_candidates`
+        applies to a proactive/balanced landing -- keeps that view and marks
+        it as shadowed; the caller then limits escape targets to those
+        configured-view landings. If no such configured candidate exists, the
+        active account that can be landed on in 5h/7d, or a readable candidate
+        the ranking could land on in 5h/7d, selects ``()``; otherwise the
+        configured tuple remains. The candidate census excludes accounts the
+        commit loop skips, so they cannot decide the view or its ranking.
+        Unreadable candidates, candidates that cannot be landed on in 5h/7d,
+        candidates with no weekly window (a row carrying only ``five_hour``
+        has headroom 100 in every view and can be landed on in none of them),
+        and membership changes for an unusable account are excluded: otherwise
+        the view and the ranking can make opposite decisions about the same
+        row, and the tick ends blocked on a view that had somewhere to go. An
+        unreadable active, or an active without a tracked model window, keeps
+        the configured view so failover and an active that can continue model
+        work are unchanged. Called on the stored snapshot and again on the
+        phase-2 refetch; the caller defers when the answers differ.
         """
         if not self._models:
             return self._models, False
@@ -786,23 +791,29 @@ class AutoSwitchEngine:
             return self._models, False
 
         readable_candidates = [
-            (num, value)
+            value
             for num in oauth_candidates
             if isinstance(value := usage.get(num), dict)
         ]
+        now = self.clock()
 
-        for num, value in readable_candidates:
-            headroom = oauth.account_headroom(value, self._models)
-            if _landable(headroom, settings.threshold):
-                return self._models, True
+        def placeable(value: dict, models: tuple[str, ...]) -> bool:
+            # What the ranking accepts as a proactive/balanced landing in this
+            # view: below the threshold, with a weekly window to score it on
+            # (`_rank_candidates` skips a candidate whose score is None).
+            return (
+                _landable(oauth.account_headroom(value, models), settings.threshold)
+                and _pace_deviation(value, models, now) is not None
+            )
+
+        if any(placeable(value, self._models) for value in readable_candidates):
+            return self._models, True
 
         active_headroom = oauth.account_headroom(active, ())
         if _landable(active_headroom, settings.threshold):
             return (), False
-        for num, value in readable_candidates:
-            headroom = oauth.account_headroom(value, ())
-            if _landable(headroom, settings.threshold):
-                return (), False
+        if any(placeable(value, ()) for value in readable_candidates):
+            return (), False
         return self._models, False
 
     # -- state file ---------------------------------------------------------

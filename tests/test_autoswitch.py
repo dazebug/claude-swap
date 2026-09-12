@@ -7274,6 +7274,34 @@ class TestBalancedModelFallback:
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert poll.to_json()["modelFallback"] is True
 
+    @pytest.mark.parametrize(
+        "active_weekly, peer_weekly, outcome, fallback",
+        [
+            (60, 20, TickOutcome.SWITCHED, True),
+            (92, 96, TickOutcome.BLOCKED, False),
+        ],
+        ids=["the-7d-view-lands-on-the-peer", "no-view-lands-anywhere"],
+    )
+    def test_a_row_with_only_a_5h_window_never_decides_the_view(
+        self, temp_home, active_weekly, peer_weekly, outcome, fallback
+    ):
+        # A usage row with no weekly window (the API's `seven_day` can be
+        # null) has headroom 100 in every view, so it read as a configured-view
+        # landing and held that view -- while the proactive ranking cannot
+        # place an account with no weekly score, and the tick ended BLOCKED on
+        # a 7d view that would have moved to #2. The view must apply the
+        # ranking's eligibility: landable AND a weekly window to place it on.
+        h = self._harness(temp_home)
+        result = h.tick_with_usage({
+            "1": _weekly(h, active_weekly, 84, fable=96),
+            "2": _weekly(h, peer_weekly, 84, fable=97),
+            "3": {"five_hour": {"pct": 0}},
+        })
+        assert result is outcome
+        assert h.active_number() == (2 if outcome is TickOutcome.SWITCHED else 1)
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert ("modelFallback" in poll.to_json()) is fallback
+
     def test_no_fallback_when_active_has_model_room(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
