@@ -380,8 +380,8 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
-            f"{self._model_fallback_tag()}"
+            f"(switch at {pct_label(self.threshold)}%){self._model_fallback_tag()}"
+            f"{tail}"
         )
 
 

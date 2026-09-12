@@ -7327,6 +7327,8 @@ class TestBalancedModelFallback:
         assert round(scores["2"], 1) == -30.0
         assert round(scores["3"], 1) == -5.0
         assert "model-limit fallback" in poll.human()
+        human = poll.human()
+        assert human.index("model-limit fallback") < human.index("| others:")
 
     def test_phase_two_reclassifies_when_weekly_fallback_changes(self, temp_home):
         h = self._harness(temp_home)
