@@ -7332,6 +7332,37 @@ class TestBalancedModelFallback:
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 1
 
+    def test_returns_when_the_fallback_view_drops_the_reason_we_left(
+        self, temp_home
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        first = {
+            "1": _weekly(h, 89, 84, fable=91, pct5=0),
+            "2": _weekly(h, 20, 84, fable=89, pct5=85),
+            "3": _weekly(h, 95, 84, fable=99, pct5=0),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.state()["leftModelFallback"] is False
+
+        second = deepcopy(first)
+        second["2"]["five_hour"]["pct"] = 95
+        second["2"]["seven_day"]["pct"] = 25
+        second["2"]["scoped"][0]["pct"] = 91
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["modelFallback"] is True
+
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage(second) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         assert h.tick_with_usage({

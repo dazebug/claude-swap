@@ -1902,6 +1902,17 @@ class AutoSwitchEngine:
             # silent hold.
             return True
         barred = str(came_from)
+        effective_models = self._models if models is None else models
+        left_fallback = bool(state.get("leftModelFallback"))
+        now_fallback = bool(self._models) and not effective_models
+        if left_fallback != now_fallback:
+            # The departure snapshot and current headroom are comparable only
+            # within one decision view. A view changes when a model window
+            # resets or every tracked model window becomes spent, so the
+            # departure reason no longer applies; let the landing gates and
+            # ranking choose the destination. The next departure records the
+            # new view, so this bypass occurs at most once per view change.
+            return True
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
         h = headroom.get(barred)
@@ -1991,12 +2002,6 @@ class AutoSwitchEngine:
                 )
                 and peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
             )
-        effective_models = self._models if models is None else models
-        if state.get("leftModelFallback") and effective_models:
-            model_pcts = _model_window_pcts(usage.get(barred), effective_models)
-            if model_pcts and max(model_pcts) < settings.threshold:
-                return True
-
         # Dominance over the ACTIVE, only reached once a real baseline is
         # confirmed to exist above -- a peer that was already miles ahead of
         # the active at departure (moved for a DIFFERENT reason -- e.g.
