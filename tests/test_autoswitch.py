@@ -2783,10 +2783,16 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
 
 
 def _two_phase_tick(
-    h: EngineHarness, stored: dict, fresh: dict
+    h: EngineHarness,
+    stored: dict,
+    fresh: dict,
+    *,
+    fresh_after_full_fetch: int = 1,
 ) -> tuple[TickOutcome, list[set]]:
     """Drive one tick where stored-snapshot collections serve ``stored``
     and the all-candidates escalation serves ``fresh``.
+
+    ``fresh_after_full_fetch`` — which all-candidates fetch first serves ``fresh``: 2 when the collector escalates on its own before phase 2 (the active at or over the threshold), so the gate still sees ``stored``.
 
     These ticks run outside the escalation band (utilization far below
     threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
@@ -2799,11 +2805,20 @@ def _two_phase_tick(
     exercising the verification it is named after.
     """
     fetch_sets: list[set] = []
+    full_fetches = 0
 
     def collect(fetch=None, **_kwargs):
+        nonlocal full_fetches
         requested = set(fetch or ())
         fetch_sets.append(requested)
-        view = fresh if requested == {"1", "2", "3"} else stored
+        if requested == {"1", "2", "3"}:
+            full_fetches += 1
+        view = (
+            fresh
+            if requested == {"1", "2", "3"}
+            and full_fetches >= fresh_after_full_fetch
+            else stored
+        )
         return {num: _entry_for(value, h.clock.now) for num, value in view.items()}
 
     with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
@@ -7214,3 +7229,134 @@ class TestBalancedStrategy:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert "stale-usage" in _reasons(h)
+
+
+class TestBalancedModelFallback:
+    """`strategy: balanced` fallback to 5h/7d only when every tracked model window
+    is at or above threshold."""
+
+    def _harness(self, temp_home: Path, live: int = 1, **kw) -> EngineHarness:
+        options = {
+            "strategy": "balanced",
+            "threshold": 90.0,
+            "hysteresis_pct": 15.0,
+            "model": "Fable",
+        }
+        options.update(kw)
+        h = EngineHarness(temp_home, **options)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live(f"{'abc'[live - 1]}@example.com", live)
+        if live != 1:
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = live
+            h.switcher._write_json(h.switcher.sequence_file, data)
+        return h
+
+    def test_fallback_to_weekly_when_every_model_window_is_spent(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _switches(h)[-1].trigger == "balanced"
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["modelFallback"] is True
+
+    def test_no_fallback_when_active_has_model_room(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=50),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _switches(h) == []
+        assert "balanced-hold" in _reasons(h)
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_existing_all_above_path_unchanged(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 95, 84, fable=95, pct5=95),
+            "2": _weekly(h, 95, 84, fable=95, pct5=95),
+            "3": _weekly(h, 95, 84, fable=95, pct5=95),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert _switches(h) == []
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_returns_to_the_left_account_once_its_model_window_resets(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=0),
+            "2": _weekly(h, 25, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["modelFallback"] is True
+        scores = poll.to_json()["paceDeviationPct"]
+        assert round(scores["1"], 1) == 10.0
+        assert round(scores["2"], 1) == -30.0
+        assert round(scores["3"], 1) == -5.0
+        assert "model-limit fallback" in poll.human()
+
+    def test_phase_two_reclassifies_when_weekly_fallback_changes(self, temp_home):
+        h = self._harness(temp_home)
+        stored = {
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        }
+        fresh = {
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=5),
+        }
+        outcome, _ = _two_phase_tick(
+            h, stored, fresh, fresh_after_full_fetch=2
+        )
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert "reclassify" in _reasons(h)
+
+    def test_best_strategy_is_not_changed(self, temp_home):
+        h = self._harness(temp_home, strategy="best")
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert _switches(h) == []
+        assert "modelFallback" not in (
+            next(e for e in h.events if isinstance(e, PollEvent)).to_json()
+        )
