@@ -7313,6 +7313,25 @@ class TestBalancedModelFallback:
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert "modelFallback" not in poll.to_json()
 
+    def test_returns_after_a_fallback_departure_even_near_the_weekly_threshold(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _weekly(h, 89, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=95),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _weekly(h, 89, 84, fable=0),
+            "2": _weekly(h, 25, 84, fable=95),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         assert h.tick_with_usage({

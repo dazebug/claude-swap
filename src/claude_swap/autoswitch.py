@@ -644,6 +644,18 @@ def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
 
+def _model_window_pcts(
+    usage_value: dict | None, models: tuple[str, ...]
+) -> list[float]:
+    if not isinstance(usage_value, dict):
+        return []
+    return [
+        pct
+        for label, pct, _ in oauth.relevant_windows(usage_value, models)
+        if label not in ("5h", "7d")
+    ]
+
+
 def _headroom_by_account(
     usage: dict[str, dict | str | None], models: tuple[str, ...]
 ) -> dict[str, float | None]:
@@ -763,10 +775,7 @@ class AutoSwitchEngine:
 
         model_window_pcts: dict[str, list[float]] = {}
         for num in candidate_accounts:
-            windows = oauth.relevant_windows(usage[num], self._models)
-            model_window_pcts[num] = [
-                pct for label, pct, _ in windows if label not in ("5h", "7d")
-            ]
+            model_window_pcts[num] = _model_window_pcts(usage[num], self._models)
             if not model_window_pcts[num]:
                 return self._models
 
@@ -1558,7 +1567,13 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(
+                    num,
+                    email,
+                    trigger,
+                    left_snapshot,
+                    left_model_fallback=models != self._models,
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1589,7 +1604,13 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(
+                num,
+                email,
+                trigger,
+                left_snapshot,
+                left_model_fallback=models != self._models,
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -1970,6 +1991,12 @@ class AutoSwitchEngine:
                 )
                 and peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
             )
+        effective_models = self._models if models is None else models
+        if state.get("leftModelFallback") and effective_models:
+            model_pcts = _model_window_pcts(usage.get(barred), effective_models)
+            if model_pcts and max(model_pcts) < settings.threshold:
+                return True
+
         # Dominance over the ACTIVE, only reached once a real baseline is
         # confirmed to exist above -- a peer that was already miles ahead of
         # the active at departure (moved for a DIFFERENT reason -- e.g.
@@ -2417,6 +2444,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        left_model_fallback: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2467,7 +2495,10 @@ class AutoSwitchEngine:
             # learn about it.
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
             state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+            state["leftRecoveryAt"] = (
+                None if recovery == float("inf") else recovery
+            )
+            state["leftModelFallback"] = left_model_fallback
             # A `consume-first` phase-2 refetch can write the SAME (None,
             # None) shape a `failover` departure writes, whenever the
             # refetched active row has a `pct` but is otherwise unmeasurable
