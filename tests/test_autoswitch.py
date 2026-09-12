@@ -7607,6 +7607,44 @@ class TestBalancedModelFallback:
             assert moves[0] == (1, 2)
             assert len(moves) <= 2
 
+    @pytest.mark.parametrize("representation", ["zero", "absent"])
+    def test_returns_to_a_landable_left_account_whether_its_model_window_is_zero_or_unreported(
+        self, temp_home, representation
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        first = {
+            "1": _weekly(h, 89, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=95, pct5=0),
+            "3": _weekly(h, 45, 84, fable=99, pct5=0),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.state()
+        assert state["leftModelFallback"] is True
+        assert state["leftHeadroom"] == 11.0
+
+        moves = []
+        for _ in range(3):
+            h.clock.advance(400)
+            current = deepcopy(first)
+            if representation == "zero":
+                current["1"]["scoped"][0]["pct"] = 0
+            else:
+                current["1"].pop("scoped")
+            before = h.active_number()
+            h.events.clear()
+            outcome = h.tick_with_usage(current)
+            after = h.active_number()
+            poll = next(e for e in h.events if isinstance(e, PollEvent))
+            assert not poll.model_fallback
+            assert after == 1
+            if outcome is TickOutcome.SWITCHED:
+                moves.append((before, after))
+
+        assert moves == [(2, 1)]
+
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         assert h.tick_with_usage({

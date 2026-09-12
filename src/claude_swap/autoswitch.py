@@ -640,6 +640,10 @@ def _every_account_above_threshold(
     return all((100.0 - h) >= threshold for h in measured)
 
 
+def _landable(headroom: float | None, threshold: float) -> bool:
+    return headroom is not None and (100.0 - headroom) < threshold
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -789,18 +793,15 @@ class AutoSwitchEngine:
 
         for num, value in readable_candidates:
             headroom = oauth.account_headroom(value, self._models)
-            if headroom is not None and (100.0 - headroom) < settings.threshold:
+            if _landable(headroom, settings.threshold):
                 return self._models, True
 
         active_headroom = oauth.account_headroom(active, ())
-        if (
-            active_headroom is not None
-            and (100.0 - active_headroom) < settings.threshold
-        ):
+        if _landable(active_headroom, settings.threshold):
             return (), False
         for num, value in readable_candidates:
             headroom = oauth.account_headroom(value, ())
-            if headroom is not None and (100.0 - headroom) < settings.threshold:
+            if _landable(headroom, settings.threshold):
                 return (), False
         return self._models, False
 
@@ -1322,7 +1323,6 @@ class AutoSwitchEngine:
                 kw["settings"],
                 kw["now"],
                 kw["current"],
-                models=kw["models"],
             )
             no_return = self._no_return_account(
                 trigger,
@@ -1332,7 +1332,6 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
-                models=kw["models"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1350,10 +1349,10 @@ class AutoSwitchEngine:
                 num
                 for num in ordered
                 if isinstance(value := usage.get(num), dict)
-                and (candidate_headroom := oauth.account_headroom(
-                    value, self._models
-                )) is not None
-                and (100.0 - candidate_headroom) < settings.threshold
+                and _landable(
+                    oauth.account_headroom(value, self._models),
+                    settings.threshold,
+                )
             ]
 
         decided_now = self.clock()
@@ -1710,7 +1709,6 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
-        models: tuple[str, ...] | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1805,6 +1803,11 @@ class AutoSwitchEngine:
         # account that is not in it bars nothing. The check was a no-op and
         # nothing killed it under mutation.
         barred = str(came_from)
+        if (
+            settings.strategy == "balanced"
+            and _landable(headroom.get(barred), settings.threshold)
+        ):
+            return None
         if not recovered:
             return barred        # the ratio below burns true on its own; see above
         left_headroom = headroom.get(barred)
@@ -1832,7 +1835,6 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         current: str | None = None,
-        models: tuple[str, ...] | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -1940,25 +1942,6 @@ class AutoSwitchEngine:
             # silent hold.
             return True
         barred = str(came_from)
-        effective_models = self._models if models is None else models
-        left_fallback = bool(state.get("leftModelFallback"))
-        now_fallback = bool(self._models) and not effective_models
-        if not left_fallback and now_fallback:
-            # The departure snapshot and current headroom are comparable only
-            # within one decision view. A view changes when a model window
-            # resets or every tracked model window becomes spent, so the
-            # departure reason no longer applies; let the landing gates and
-            # ranking choose the destination. The next departure records the
-            # new view, so this bypass occurs at most once per view change.
-            return True
-        if left_fallback and not now_fallback:
-            # A read failure can move the effective view only toward the
-            # configured set, so only this direction must distinguish it from
-            # a model-window reset. Release the bar only when the barred
-            # account itself reports a tracked model window below threshold.
-            model_pcts = _model_window_pcts(usage.get(barred), effective_models)
-            if model_pcts and max(model_pcts) < settings.threshold:
-                return True
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
         h = headroom.get(barred)
@@ -2013,10 +1996,10 @@ class AutoSwitchEngine:
             if h is not None and h > 100.0 - settings.threshold:
                 return True
             peer_recovery_ts = _binding_recovery_ts(
-                usage.get(barred), self._models if models is None else models, now
+                usage.get(barred), self._models, now
             )
             active_recovery_ts = _binding_recovery_ts(
-                usage.get(current), self._models if models is None else models, now
+                usage.get(current), self._models, now
             )
             # The active's recovery must be a REAL measurement, not merely
             # "larger" -- `_binding_recovery_ts` returns `inf` for both
@@ -2098,7 +2081,7 @@ class AutoSwitchEngine:
         )
         return (
             _binding_recovery_ts(
-                usage.get(barred), self._models if models is None else models, now
+                usage.get(barred), self._models, now
             )
             < was - RECOVERY_HYSTERESIS_S
         )
@@ -2211,7 +2194,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if not _landable(h, settings.threshold) and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
