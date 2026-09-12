@@ -1490,7 +1490,10 @@ class AutoSwitchEngine:
                 )
                 standing = ", ".join(
                     f"#{num} " + ("?" if d is None else f"{d:+.1f}")
-                    for num, d in sorted(scores.items(), key=lambda kv: int(kv[0]))
+                    for num, d in sorted(
+                        scores.items(), key=lambda kv: int(kv[0])
+                    )
+                    if num == current or num in oauth_candidates
                 )
                 self._emit(
                     NoSwitchEvent(

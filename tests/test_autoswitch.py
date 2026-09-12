@@ -7645,6 +7645,34 @@ class TestBalancedModelFallback:
 
         assert moves == [(2, 1)]
 
+    def test_the_balanced_hold_lists_only_the_accounts_it_could_choose_from(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(h, 60, 84, fable=50, pct5=0),
+            "2": _weekly(h, 55, 84, fable=50, pct5=0),
+            "3": _weekly(h, 0, 84, fable=0, pct5=0),
+        }
+
+        def live_session_pids(*args, **kwargs):
+            values = [*args, *kwargs.values()]
+            return [4242] if any(str(value) == "3" for value in values) else []
+
+        with patch.object(
+            h.switcher, "_live_session_pids", side_effect=live_session_pids
+        ):
+            assert h.tick_with_usage(rows) is TickOutcome.NO_ACTION
+
+        hold = next(
+            event
+            for event in h.events
+            if getattr(event, "reason", None) == "balanced-hold"
+        )
+        assert "#1" in hold.detail
+        assert "#2" in hold.detail
+        assert "#3" not in hold.detail
+
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         assert h.tick_with_usage({
