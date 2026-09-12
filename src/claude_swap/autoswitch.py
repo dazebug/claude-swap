@@ -754,19 +754,22 @@ class AutoSwitchEngine:
     ) -> tuple[str, ...]:
         """Choose the configured or 5h/7d view from landability.
 
-        The configured model view is eligible for fallback only when the
-        active account reports a tracked model window at or over the threshold.
-        A readable OAuth candidate with room on the configured windows keeps
-        that view, because it is a landable destination without fallback. If
-        neither condition applies, ``()`` is selected when the active account
-        or a readable candidate is landable on 5h/7d. Rows that are unreadable,
-        lack a tracked model window, or cannot be landed on are excluded: their
-        read or membership state must not change the view. Otherwise the two
-        views can make opposite decisions about a spent account and switch
-        back and forth on unchanged usage. An unreadable active keeps the
-        configured view so the failover path is unchanged. Called on the
-        stored snapshot and again on the phase-2 refetch; the caller defers
-        when the two answers differ.
+        The configured view is eligible for fallback only when the active
+        account reports a tracked model window at or over the threshold. A
+        readable OAuth candidate that can be landed on in the configured view
+        keeps that view, and a candidate owned by a live session is not counted
+        as a landing in either view. If no such configured candidate exists,
+        the active account or a readable, unowned candidate that can be landed
+        on in 5h/7d selects ``()``; otherwise the configured tuple remains.
+        Unreadable candidates, candidates that cannot be landed on in 5h/7d,
+        and accounts skipped by the commit loop are excluded so read or
+        membership changes for an unusable account cannot change the view.
+        Otherwise the two views can make opposite decisions about a spent
+        account and switch back and forth on unchanged usage. An unreadable
+        active, or an active without a tracked model window, keeps the
+        configured view so failover and an active that can continue model work
+        are unchanged. Called on the stored snapshot and again on the phase-2
+        refetch; the caller defers when the two answers differ.
         """
         if not self._models:
             return self._models
@@ -778,18 +781,33 @@ class AutoSwitchEngine:
             return self._models
 
         readable_candidates = [
-            value
+            (num, value)
             for num in oauth_candidates
             if isinstance(value := usage.get(num), dict)
         ]
-        for value in readable_candidates:
-            headroom = oauth.account_headroom(value, self._models)
-            if headroom is not None and (100.0 - headroom) < settings.threshold:
+
+        owned_candidates: dict[str, bool] = {}
+
+        def can_land(number: str, value: dict, models: tuple[str, ...]) -> bool:
+            headroom = oauth.account_headroom(value, models)
+            if headroom is None or (100.0 - headroom) >= settings.threshold:
+                return False
+            if number not in owned_candidates:
+                owned_candidates[number] = self._owned_by_live_session(number)
+            return not owned_candidates[number]
+
+        for num, value in readable_candidates:
+            if can_land(num, value, self._models):
                 return self._models
 
-        for value in [active, *readable_candidates]:
-            headroom = oauth.account_headroom(value, ())
-            if headroom is not None and (100.0 - headroom) < settings.threshold:
+        active_headroom = oauth.account_headroom(active, ())
+        if (
+            active_headroom is not None
+            and (100.0 - active_headroom) < settings.threshold
+        ):
+            return ()
+        for num, value in readable_candidates:
+            if can_land(num, value, ()):
                 return ()
         return self._models
 
@@ -874,6 +892,13 @@ class AutoSwitchEngine:
 
     # -- freshening -----------------------------------------------------------
 
+    def _owned_by_live_session(self, number: str) -> bool:
+        return bool(
+            self.switcher.live_session_pids_for(
+                number, self.switcher.account_email(number)
+            )
+        )
+
     def _freshen_target(self, number: str, email: str) -> str:
         """Ensure a candidate's stored token outlives Claude Code's 5-min
         refresh buffer before it gets activated.
@@ -887,7 +912,7 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(number, email):
+        if self._owned_by_live_session(number):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
             # one rotating refresh token in two config dirs (the stale-copy

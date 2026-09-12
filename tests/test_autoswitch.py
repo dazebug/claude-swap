@@ -7232,8 +7232,8 @@ class TestBalancedStrategy:
 
 
 class TestBalancedModelFallback:
-    """`strategy: balanced` fallback to 5h/7d only when every tracked model window
-    is at or above threshold."""
+    """`strategy: balanced` fallback to 5h/7d only when no configured-view
+    landing is available."""
 
     def _harness(self, temp_home: Path, live: int = 1, **kw) -> EngineHarness:
         options = {
@@ -7425,6 +7425,77 @@ class TestBalancedModelFallback:
 
         assert trace == [(tick, True, 2) for tick in range(6)]
         assert moves == [(1, 2)]
+
+    @pytest.mark.parametrize("scenario", ["loop", "phase2"])
+    @pytest.mark.parametrize("owned", [False, True])
+    def test_a_candidate_owned_by_a_live_session_is_not_a_landing(
+        self, temp_home, scenario, owned
+    ):
+        from copy import deepcopy
+        from unittest.mock import patch
+
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=100, pct5=0),
+            "3": _weekly(h, 0, 84, fable=0, pct5=0),
+        }
+
+        def live_session_pids(*args, **kwargs):
+            values = [*args, *kwargs.values()]
+            return [4242] if owned and any(str(value) == "3" for value in values) else []
+
+        with patch.object(
+            h.switcher, "_live_session_pids", side_effect=live_session_pids
+        ):
+            if scenario == "loop":
+                moves = []
+                trace = []
+                for tick in range(6):
+                    h.clock.advance(4000)
+                    now = h.clock.now
+                    entries = {
+                        num: _entry_for(value, now)
+                        for num, value in deepcopy(rows).items()
+                    }
+                    if tick % 2 == 0:
+                        entries["3"] = UsageEntry(
+                            last_good=rows["3"],
+                            fetched_at=now - 4000,
+                            age_s=4000,
+                            last_error="timeout",
+                            consecutive_failures=6,
+                            backoff_until=now + 600,
+                            trust_extended=False,
+                        )
+                    before = h.active_number()
+                    h.events.clear()
+                    outcome = h.tick_with_entries(entries)
+                    after = h.active_number()
+                    poll = next(e for e in h.events if isinstance(e, PollEvent))
+                    trace.append((tick, bool(poll.model_fallback), after))
+                    if outcome is TickOutcome.SWITCHED:
+                        moves.append((before, after))
+
+                if owned:
+                    assert trace == [(tick, True, 2) for tick in range(6)]
+                    assert moves == [(1, 2)]
+                else:
+                    assert moves == [(1, 2), (2, 3)]
+            else:
+                stored = deepcopy(rows)
+                stored["3"] = None
+                outcome, _ = _two_phase_tick(
+                    h, stored, deepcopy(rows), fresh_after_full_fetch=2
+                )
+                if owned:
+                    assert outcome is TickOutcome.SWITCHED
+                    assert h.active_number() == 2
+                    assert "reclassify" not in _reasons(h)
+                else:
+                    assert outcome is TickOutcome.NO_ACTION
+                    assert h.active_number() == 1
+                    assert "reclassify" in _reasons(h)
 
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
