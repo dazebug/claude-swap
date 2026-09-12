@@ -1074,6 +1074,9 @@ class AutoSwitchEngine:
         }
 
         # -- candidate census -------------------------------------------
+        # The no-return bar is not applied here: it is a statement about the
+        # CHOICE, so it lives in `_rank` where the choice is made. See
+        # `_no_return_account` for the incident, the scoping, and the release.
         candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
@@ -1242,10 +1245,6 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        # The no-return bar itself lives in `_rank` below: it is a statement
-        # about the CHOICE, so it belongs where the choice is made rather than
-        # in this census of what exists. See `_no_return_account` for the
-        # incident, the scoping, and the release.
         if (
             trigger in ("consume-first", "balanced")
             and not oauth_candidates
@@ -1352,6 +1351,10 @@ class AutoSwitchEngine:
             return ranked
 
         def _shadowed_order(ordered: list[str]) -> list[str]:
+            # With the configured view shadowed (see `_decision_models`), an
+            # escape lands only where that view can land: at-limit and
+            # failover skip the landing gate, and a spent model window would
+            # re-trigger on the next tick.
             if not shadowed or trigger not in (
                 "at-limit", "failover", "proactive"
             ):
@@ -1736,7 +1739,9 @@ class AutoSwitchEngine:
 
         SCOPED like every sibling gate — `at-limit` and `failover` skip the
         anti-flap gates by design. Unscoped this stranded a 2-account fleet on
-        an exhausted active with the peer at 0%.
+        an exhausted active with the peer at 0%. Under ``balanced`` it covers
+        only an account that cannot be landed on in the current view — see
+        the check below.
 
         AND SCOPED TO THE ENGINE'S OWN LANDING (`lastSwitchTo == current`).
         The bar refuses to undo THIS ENGINE'S last move; once the user
@@ -1817,6 +1822,12 @@ class AutoSwitchEngine:
         # account that is not in it bars nothing. The check was a no-op and
         # nothing killed it under mutation.
         barred = str(came_from)
+        # Under `balanced` an account that can be landed on in this tick's
+        # view is never barred. It was over the threshold in this same view
+        # when the engine left it, so the landing gate in `_rank_candidates`
+        # refuses it until it genuinely recovers, and between two healthy
+        # accounts the pace hysteresis bounds the move rate. The bar stays for
+        # the all-above escape, which lands over the threshold on purpose.
         if (
             settings.strategy == "balanced"
             and _landable(headroom.get(barred), settings.threshold)
@@ -2144,16 +2155,14 @@ class AutoSwitchEngine:
         any_known = any(headroom.get(n) is not None for n in oauth_candidates)
         if balanced and trigger not in ("at-limit", "failover"):
             # Under `balanced` an account with no weekly window has no score,
-            # and the proactive/balanced ranking cannot place it (a spend
-            # there cannot be scheduled). Then it is not a healthy CANDIDATE
-            # for the censuses below either -- one universe for the censuses
-            # and the loop. Measured: a row carrying only `five_hour`
-            # (headroom 100) read as the fleet's one healthy account, turned
-            # `all_above` off, and was then skipped as unplaceable -- BLOCKED
-            # on an active at 96% with a peer resetting in 30 minutes, while
-            # the same fleet with that row unreadable moved to the peer.
-            # At-limit and failover keep every readable row: those escapes
-            # rank a scoreless account last but do take it.
+            # and the proactive/balanced ranking cannot place it. Then it is
+            # not a healthy candidate for the censuses below either -- one
+            # universe for the censuses and the loop. Counted, a row carrying
+            # only `five_hour` (headroom 100) turned `all_above` off as the
+            # fleet's one healthy account and was then skipped as unplaceable:
+            # blocked at 96% with a peer resetting in 30 minutes. At-limit and
+            # failover keep every readable row -- those escapes rank a
+            # scoreless account last but do take it.
             oauth_candidates = [
                 n for n in oauth_candidates if scores.get(n) is not None
             ]

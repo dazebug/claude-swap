@@ -6996,7 +6996,7 @@ class TestBalancedStrategy:
         assert _switches(h)[-1].trigger == "proactive"
 
     def test_a_scoreless_peer_is_still_no_proactive_landing(self, temp_home):
-        # The census fix above must not admit such rows through the all-above
+        # The narrowed universe must not admit such rows through the all-above
         # escape instead: with nothing else to land on the tick stays blocked
         # (and reports the readable-but-unplaceable peers as such, not as
         # unreadable). At-limit takes them as a last resort, as before.
