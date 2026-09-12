@@ -2949,10 +2949,16 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
 
 
 def _two_phase_tick(
-    h: EngineHarness, stored: dict, fresh: dict
+    h: EngineHarness,
+    stored: dict,
+    fresh: dict,
+    *,
+    fresh_after_full_fetch: int = 1,
 ) -> tuple[TickOutcome, list[set]]:
     """Drive one tick where stored-snapshot collections serve ``stored``
     and the all-candidates escalation serves ``fresh``.
+
+    ``fresh_after_full_fetch`` — which all-candidates fetch first serves ``fresh``: 2 when the collector escalates on its own before phase 2 (the active at or over the threshold), so the gate still sees ``stored``.
 
     These ticks run outside the escalation band (utilization far below
     threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
@@ -2965,11 +2971,20 @@ def _two_phase_tick(
     exercising the verification it is named after.
     """
     fetch_sets: list[set] = []
+    full_fetches = 0
 
     def collect(fetch=None, **_kwargs):
+        nonlocal full_fetches
         requested = set(fetch or ())
         fetch_sets.append(requested)
-        view = fresh if requested == {"1", "2", "3"} else stored
+        if requested == {"1", "2", "3"}:
+            full_fetches += 1
+        view = (
+            fresh
+            if requested == {"1", "2", "3"}
+            and full_fetches >= fresh_after_full_fetch
+            else stored
+        )
         return {num: _entry_for(value, h.clock.now) for num, value in view.items()}
 
     with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
@@ -7266,6 +7281,42 @@ class TestBalancedStrategy:
             h.switcher._write_json(h.switcher.sequence_file, data)
         return h
 
+    def test_a_row_with_only_a_5h_window_does_not_veto_the_all_above_escape(
+        self, temp_home
+    ):
+        # A usage row with no weekly window has headroom 100, so the all-above
+        # census read it as the fleet's one healthy account and turned the
+        # all-above escape off -- while the ranking cannot place it. BLOCKED at
+        # 96% with a peer holding twice its room; the same fleet with that row
+        # unreadable moved to the peer. A row the ranking cannot choose must
+        # not count as a healthy candidate for the censuses either. (Upstream's
+        # escape ranks by room since #473, so the peer needs the room margin:
+        # 8 points against the active's 4.)
+        h = self._harness(temp_home, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 96, 84),
+            "2": _weekly(h, 92, 0.5),
+            "3": {"five_hour": {"pct": 0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _switches(h)[-1].trigger == "proactive"
+
+    def test_a_scoreless_peer_is_still_no_proactive_landing(self, temp_home):
+        # The narrowed universe must not admit such rows through the all-above
+        # escape instead: with nothing else to land on the tick stays blocked
+        # (and reports the readable-but-unplaceable peers as such, not as
+        # unreadable). At-limit takes them as a last resort, as before.
+        h = self._harness(temp_home, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 96, 84),
+            "2": {"five_hour": {"pct": 0}},
+            "3": {"five_hour": {"pct": 0}},
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert "no-qualifying-candidate" in _reasons(h)
+
     def test_moves_to_the_account_furthest_behind_its_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
@@ -7519,3 +7570,498 @@ class TestBalancedStrategy:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert "stale-usage" in _reasons(h)
+
+
+def _session_owning(number):
+    def pids(account_num, email):
+        return [4242] if number is not None and str(account_num) == str(number) else []
+
+    return pids
+
+
+class TestBalancedModelFallback:
+    """`strategy: balanced` fallback to 5h/7d only when no configured-view
+    landing is available."""
+
+    def _harness(self, temp_home: Path, live: int = 1, **kw) -> EngineHarness:
+        options = {
+            "strategy": "balanced",
+            "threshold": 90.0,
+            "hysteresis_pct": 15.0,
+            "model": "Fable",
+        }
+        options.update(kw)
+        h = EngineHarness(temp_home, **options)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live(f"{'abc'[live - 1]}@example.com", live)
+        if live != 1:
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = live
+            h.switcher._write_json(h.switcher.sequence_file, data)
+        return h
+
+    def test_fallback_to_weekly_when_every_model_window_is_spent(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _switches(h)[-1].trigger == "balanced"
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["modelFallback"] is True
+
+    @pytest.mark.parametrize(
+        "active_weekly, peer_weekly, outcome, fallback",
+        [
+            (60, 20, TickOutcome.SWITCHED, True),
+            (92, 96, TickOutcome.BLOCKED, False),
+        ],
+        ids=["the-7d-view-lands-on-the-peer", "no-view-lands-anywhere"],
+    )
+    def test_a_row_with_only_a_5h_window_never_decides_the_view(
+        self, temp_home, active_weekly, peer_weekly, outcome, fallback
+    ):
+        # A usage row with no weekly window (the API's `seven_day` can be
+        # null) has headroom 100 in every view, so it read as a configured-view
+        # landing and held that view -- while the proactive ranking cannot
+        # place an account with no weekly score, and the tick ended BLOCKED on
+        # a 7d view that would have moved to #2. The view must apply the
+        # ranking's eligibility: landable AND a weekly window to place it on.
+        h = self._harness(temp_home)
+        result = h.tick_with_usage({
+            "1": _weekly(h, active_weekly, 84, fable=96),
+            "2": _weekly(h, peer_weekly, 84, fable=97),
+            "3": {"five_hour": {"pct": 0}},
+        })
+        assert result is outcome
+        assert h.active_number() == (2 if outcome is TickOutcome.SWITCHED else 1)
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert ("modelFallback" in poll.to_json()) is fallback
+
+    def test_no_fallback_when_active_has_model_room(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=50),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _switches(h) == []
+        assert "balanced-hold" in _reasons(h)
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_existing_all_above_path_unchanged(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 95, 84, fable=95, pct5=95),
+            "2": _weekly(h, 95, 84, fable=95, pct5=95),
+            "3": _weekly(h, 95, 84, fable=95, pct5=95),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert _switches(h) == []
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    @pytest.mark.parametrize("weekly, peer_fable", [(60, 97), (89, 95)], ids=["clear-of-the-weekly-threshold", "near-the-weekly-threshold"])
+    def test_returns_to_the_left_account_once_its_model_window_resets(
+        self, temp_home, weekly, peer_fable
+    ):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _weekly(h, weekly, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=peer_fable),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _weekly(h, weekly, 84, fable=0),
+            "2": _weekly(h, 25, 84, fable=peer_fable),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_returns_when_the_fallback_view_drops_the_reason_we_left(
+        self, temp_home
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        first = {
+            "1": _weekly(h, 89, 84, fable=91, pct5=0),
+            "2": _weekly(h, 20, 84, fable=89, pct5=85),
+            "3": _weekly(h, 95, 84, fable=99, pct5=0),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.state()["leftModelFallback"] is False
+
+        second = deepcopy(first)
+        second["2"]["five_hour"]["pct"] = 95
+        second["2"]["seven_day"]["pct"] = 25
+        second["2"]["scoped"][0]["pct"] = 91
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["modelFallback"] is True
+
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage(second) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("representation", ["zero", "absent"])
+    def test_returns_to_a_landable_left_account_whether_its_model_window_is_zero_or_unreported(
+        self, temp_home, representation
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        first = {
+            "1": _weekly(h, 89, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=95, pct5=0),
+            "3": _weekly(h, 45, 84, fable=99, pct5=0),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.state()
+        assert state["leftModelFallback"] is True
+        assert state["leftHeadroom"] == 11.0
+
+        moves = []
+        for _ in range(3):
+            h.clock.advance(400)
+            current = deepcopy(first)
+            if representation == "zero":
+                current["1"]["scoped"][0]["pct"] = 0
+            else:
+                current["1"].pop("scoped")
+            before = h.active_number()
+            h.events.clear()
+            outcome = h.tick_with_usage(current)
+            after = h.active_number()
+            poll = next(e for e in h.events if isinstance(e, PollEvent))
+            assert not poll.model_fallback
+            assert after == 1
+            if outcome is TickOutcome.SWITCHED:
+                moves.append((before, after))
+
+        assert moves == [(2, 1)]
+
+    @pytest.mark.parametrize("cause", ["timeout", "missing-model", "membership"])
+    @pytest.mark.parametrize("route", ["control", "recovery", "dominance", "at-limit"])
+    def test_the_view_ignores_rows_that_cannot_be_landed_on(
+        self, temp_home, cause, route
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(
+                h, 60, 84, fable=94 if route == "dominance" else 96, pct5=0
+            ),
+            "2": _weekly(
+                h, 20, 84, fable=100 if route == "at-limit" else 99, pct5=0
+            ),
+            "3": _weekly(h, 100, 84, fable=99, pct5=0),
+        }
+        if route == "recovery":
+            rows["1"]["scoped"][0]["resets_at"] = _iso_at(
+                h.clock.now + 24 * _HOUR
+            )
+        if cause == "membership" and route != "control":
+            rows["3"]["scoped"] = []
+
+        moves = []
+        trace = []
+        for tick in range(6):
+            h.clock.advance(4000)
+            now = h.clock.now
+            if cause == "membership" and route != "control":
+                data = h.switcher._get_sequence_data()
+                data["accounts"]["3"]["disabled"] = tick % 2 == 0
+                h.switcher._write_json(h.switcher.sequence_file, data)
+            tick_rows = deepcopy(rows)
+            entries = {
+                num: _entry_for(value, now) for num, value in tick_rows.items()
+            }
+            if cause == "timeout" and route != "control" and tick % 2:
+                entries["3"] = UsageEntry(
+                    last_good=rows["3"],
+                    fetched_at=now - 4000,
+                    age_s=4000,
+                    last_error="timeout",
+                    consecutive_failures=6,
+                    backoff_until=now + 600,
+                    trust_extended=False,
+                )
+            elif cause == "missing-model" and route != "control" and tick % 2:
+                tick_rows["3"]["scoped"] = []
+                entries["3"] = _entry_for(tick_rows["3"], now)
+
+            before = h.active_number()
+            h.events.clear()
+            outcome = h.tick_with_entries(entries)
+            after = h.active_number()
+            poll = next(e for e in h.events if isinstance(e, PollEvent))
+            trace.append((tick, bool(poll.model_fallback), after))
+            if outcome is TickOutcome.SWITCHED:
+                moves.append((before, after))
+
+        assert trace == [(tick, True, 2) for tick in range(6)]
+        assert moves == [(1, 2)]
+
+    @pytest.mark.parametrize("scenario", ["loop", "phase2"])
+    @pytest.mark.parametrize("owned", [False, True])
+    def test_a_candidate_owned_by_a_live_session_is_not_a_landing(
+        self, temp_home, scenario, owned
+    ):
+        from copy import deepcopy
+
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=100, pct5=0),
+            "3": _weekly(h, 0, 84, fable=0, pct5=0),
+        }
+
+        session_pids = _session_owning("3" if owned else None)
+        with patch.object(h.switcher, "_live_session_pids", side_effect=session_pids):
+            if scenario == "loop":
+                moves = []
+                trace = []
+                for tick in range(6):
+                    h.clock.advance(4000)
+                    now = h.clock.now
+                    entries = {
+                        num: _entry_for(value, now)
+                        for num, value in deepcopy(rows).items()
+                    }
+                    if tick % 2 == 0:
+                        entries["3"] = UsageEntry(
+                            last_good=rows["3"],
+                            fetched_at=now - 4000,
+                            age_s=4000,
+                            last_error="timeout",
+                            consecutive_failures=6,
+                            backoff_until=now + 600,
+                            trust_extended=False,
+                        )
+                    before = h.active_number()
+                    h.events.clear()
+                    outcome = h.tick_with_entries(entries)
+                    after = h.active_number()
+                    poll = next(e for e in h.events if isinstance(e, PollEvent))
+                    trace.append((tick, bool(poll.model_fallback), after))
+                    if outcome is TickOutcome.SWITCHED:
+                        moves.append((before, after))
+
+                if owned:
+                    assert trace == [(tick, True, 2) for tick in range(6)]
+                    assert moves == [(1, 2)]
+                else:
+                    assert moves == [(1, 2), (2, 3)]
+            else:
+                stored = deepcopy(rows)
+                stored["3"] = None
+                outcome, _ = _two_phase_tick(
+                    h, stored, deepcopy(rows), fresh_after_full_fetch=2
+                )
+                if owned:
+                    assert outcome is TickOutcome.SWITCHED
+                    assert h.active_number() == 2
+                    assert "reclassify" not in _reasons(h)
+                else:
+                    assert outcome is TickOutcome.NO_ACTION
+                    assert h.active_number() == 1
+                    assert "reclassify" in _reasons(h)
+
+    @pytest.mark.parametrize("owned", [False, True])
+    @pytest.mark.parametrize("age", [0, 600])
+    def test_an_owned_candidate_is_not_ranked(self, temp_home, owned, age):
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=100, pct5=0),
+            "3": _weekly(h, 0, 84, fable=0, pct5=0),
+        }
+
+        h.clock.advance(4000)
+        now = h.clock.now
+        entries = {num: _entry_for(value, now) for num, value in rows.items()}
+        if age:
+            entries["3"] = UsageEntry(
+                last_good=rows["3"],
+                fetched_at=now - age,
+                age_s=age,
+                last_error="timeout",
+                consecutive_failures=1,
+                backoff_until=now + 600,
+                trust_extended=True,
+            )
+
+        session_pids = _session_owning("3" if owned else None)
+        with patch.object(h.switcher, "_live_session_pids", side_effect=session_pids):
+            outcome = h.tick_with_entries(entries)
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == (2 if owned else 3)
+
+    @pytest.mark.parametrize("refresh_error", ["ready", "transient", "invalid_client"])
+    def test_a_candidate_the_loop_cannot_land_on_does_not_pull_the_engine_back(
+        self, temp_home, refresh_error
+    ):
+        from contextlib import ExitStack
+        from copy import deepcopy
+        from unittest.mock import patch
+
+        from claude_swap.oauth import RefreshOutcome
+
+        h = self._harness(temp_home)
+        now = h.clock.now
+        h.seed(3, "c@example.com", expires_at=int((now + 590) * 1000))
+        rows = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=100, pct5=0),
+            "3": _weekly(h, 0, 84, fable=100, pct5=0),
+        }
+        moves = []
+
+        with ExitStack() as stack:
+            if refresh_error == "ready":
+                refresh_call = stack.enter_context(
+                    patch(
+                        "claude_swap.oauth.try_refresh_oauth_credentials",
+                        side_effect=AssertionError("refresh was not expected"),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        h.switcher,
+                        "consume_backup_grant",
+                        return_value=RefreshOutcome(
+                            h.switcher.read_account_credentials(
+                                "3", "c@example.com"
+                            ),
+                            None,
+                        ),
+                    )
+                )
+            else:
+                refresh_call = stack.enter_context(
+                    patch(
+                        "claude_swap.oauth.try_refresh_oauth_credentials",
+                        return_value=RefreshOutcome(None, refresh_error),
+                    )
+                )
+            for tick in range(8):
+                h.clock.advance(61)
+                tick_rows = deepcopy(rows)
+                if tick % 2:
+                    tick_rows["3"]["scoped"] = []
+                entries = {
+                    num: _entry_for(value, h.clock.now)
+                    for num, value in tick_rows.items()
+                }
+                before = h.active_number()
+                h.events.clear()
+                outcome = h.tick_with_entries(entries)
+                after = h.active_number()
+                if outcome is TickOutcome.SWITCHED:
+                    moves.append((before, after))
+
+        assert h.state().get("quarantine", {}) == {}
+        if refresh_error == "ready":
+            assert refresh_call.call_count == 0
+            assert moves == [(1, 3)]
+        else:
+            assert refresh_call.call_count > 0
+            assert moves[0] == (1, 2)
+            assert len(moves) <= 2
+
+    def test_the_balanced_hold_lists_only_the_accounts_it_could_choose_from(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(h, 60, 84, fable=50, pct5=0),
+            "2": _weekly(h, 55, 84, fable=50, pct5=0),
+            "3": _weekly(h, 0, 84, fable=0, pct5=0),
+        }
+
+        with patch.object(
+            h.switcher, "_live_session_pids", side_effect=_session_owning("3")
+        ):
+            assert h.tick_with_usage(rows) is TickOutcome.NO_ACTION
+
+        hold = next(
+            event
+            for event in h.events
+            if getattr(event, "reason", None) == "balanced-hold"
+        )
+        assert "#1" in hold.detail
+        assert "#2" in hold.detail
+        assert "#3" not in hold.detail
+
+    def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        }) is TickOutcome.SWITCHED
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["modelFallback"] is True
+        scores = poll.to_json()["paceDeviationPct"]
+        assert round(scores["1"], 1) == 10.0
+        assert round(scores["2"], 1) == -30.0
+        assert round(scores["3"], 1) == -5.0
+        assert "model-limit fallback" in poll.human()
+        human = poll.human()
+        assert human.index("model-limit fallback") < human.index("| others:")
+
+    def test_phase_two_reclassifies_when_weekly_fallback_changes(self, temp_home):
+        h = self._harness(temp_home)
+        stored = {
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        }
+        fresh = {
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=5),
+        }
+        outcome, _ = _two_phase_tick(
+            h, stored, fresh, fresh_after_full_fetch=2
+        )
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert "reclassify" in _reasons(h)
+
+    def test_best_strategy_is_not_changed(self, temp_home):
+        h = self._harness(temp_home, strategy="best")
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert _switches(h) == []
+        assert "modelFallback" not in (
+            next(e for e in h.events if isinstance(e, PollEvent)).to_json()
+        )
