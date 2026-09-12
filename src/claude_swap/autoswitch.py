@@ -343,7 +343,7 @@ class PollEvent(AutoSwitchEvent):
             return ""
         models = ", ".join(self.model_fallback)
         return (
-            f" · model-limit fallback ({models} spent on every account; "
+            f" · model-limit fallback ({models}: no account to land on; "
             "deciding on 5h/7d)"
         )
 
@@ -751,34 +751,35 @@ class AutoSwitchEngine:
         current: str,
         oauth_candidates: list[str],
         settings: AutoSwitchSettings,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], bool]:
         """Choose the configured or 5h/7d view from landability.
 
         The configured view is eligible for fallback only when the active
         account reports a tracked model window at or over the threshold. A
         readable OAuth candidate that can be landed on in the configured view
-        keeps that view, and a candidate owned by a live session is not counted
-        as a landing in either view. If no such configured candidate exists,
-        the active account or a readable, unowned candidate that can be landed
-        on in 5h/7d selects ``()``; otherwise the configured tuple remains.
-        Unreadable candidates, candidates that cannot be landed on in 5h/7d,
-        and accounts skipped by the commit loop are excluded so read or
-        membership changes for an unusable account cannot change the view.
-        Otherwise the two views can make opposite decisions about a spent
-        account and switch back and forth on unchanged usage. An unreadable
-        active, or an active without a tracked model window, keeps the
-        configured view so failover and an active that can continue model work
-        are unchanged. Called on the stored snapshot and again on the phase-2
-        refetch; the caller defers when the two answers differ.
+        keeps that view and marks it as shadowed; the caller then limits escape
+        targets to those configured-view landings. If no such configured
+        candidate exists, the active account or a readable candidate that can
+        be landed on in 5h/7d selects ``()``; otherwise the configured tuple
+        remains. The candidate census excludes accounts the commit loop skips,
+        so they cannot decide the view or its ranking. Unreadable candidates,
+        candidates that cannot be landed on in 5h/7d, and membership changes
+        for an unusable account are excluded: otherwise the two views can make
+        opposite decisions about a spent account and switch back and forth on
+        unchanged usage. An unreadable active, or an active without a tracked
+        model window, keeps the configured view so failover and an active that
+        can continue model work are unchanged. Called on the stored snapshot
+        and again on the phase-2 refetch; the caller defers when the answers
+        differ.
         """
         if not self._models:
-            return self._models
+            return self._models, False
         active = usage.get(current)
         if not isinstance(active, dict):
-            return self._models
+            return self._models, False
         active_model_pcts = _model_window_pcts(active, self._models)
         if not active_model_pcts or max(active_model_pcts) < settings.threshold:
-            return self._models
+            return self._models, False
 
         readable_candidates = [
             (num, value)
@@ -786,30 +787,22 @@ class AutoSwitchEngine:
             if isinstance(value := usage.get(num), dict)
         ]
 
-        owned_candidates: dict[str, bool] = {}
-
-        def can_land(number: str, value: dict, models: tuple[str, ...]) -> bool:
-            headroom = oauth.account_headroom(value, models)
-            if headroom is None or (100.0 - headroom) >= settings.threshold:
-                return False
-            if number not in owned_candidates:
-                owned_candidates[number] = self._owned_by_live_session(number)
-            return not owned_candidates[number]
-
         for num, value in readable_candidates:
-            if can_land(num, value, self._models):
-                return self._models
+            headroom = oauth.account_headroom(value, self._models)
+            if headroom is not None and (100.0 - headroom) < settings.threshold:
+                return self._models, True
 
         active_headroom = oauth.account_headroom(active, ())
         if (
             active_headroom is not None
             and (100.0 - active_headroom) < settings.threshold
         ):
-            return ()
+            return (), False
         for num, value in readable_candidates:
-            if can_land(num, value, ()):
-                return ()
-        return self._models
+            headroom = oauth.account_headroom(value, ())
+            if headroom is not None and (100.0 - headroom) < settings.threshold:
+                return (), False
+        return self._models, False
 
     # -- state file ---------------------------------------------------------
 
@@ -1077,6 +1070,10 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        if balanced:
+            oauth_candidates = [
+                n for n in oauth_candidates if not self._owned_by_live_session(n)
+            ]
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
@@ -1087,13 +1084,13 @@ class AutoSwitchEngine:
             current, quarantined, threshold=settings.threshold
         )
 
-        # balanced: when the tracked model windows are spent on every account,
-        # this tick is decided on 5h/7d alone (see `_decision_models`). The
-        # poll reports it; collection and the scheduler keep the configured set.
-        models = (
+        # balanced: when no configured-view landing remains, this tick can be
+        # decided on 5h/7d alone (see `_decision_models`). The poll reports it;
+        # collection and the scheduler keep the configured set.
+        models, shadowed = (
             self._decision_models(usage, current, oauth_candidates, settings)
             if balanced
-            else self._models
+            else (self._models, False)
         )
         if models != self._models:
             headroom = _headroom_by_account(usage, models)
@@ -1344,6 +1341,21 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        def _shadowed_order(ordered: list[str]) -> list[str]:
+            if not shadowed or trigger not in (
+                "at-limit", "failover", "proactive"
+            ):
+                return ordered
+            return [
+                num
+                for num in ordered
+                if isinstance(value := usage.get(num), dict)
+                and (candidate_headroom := oauth.account_headroom(
+                    value, self._models
+                )) is not None
+                and (100.0 - candidate_headroom) < settings.threshold
+            ]
+
         decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
@@ -1357,6 +1369,7 @@ class AutoSwitchEngine:
             settings=settings,
             now=decided_now,
         )
+        ordered = _shadowed_order(ordered)
 
         if trigger in ("consume-first", "balanced") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -1378,7 +1391,7 @@ class AutoSwitchEngine:
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             if trigger == "balanced":
-                models2 = self._decision_models(
+                models2, shadowed2 = self._decision_models(
                     usage, current, oauth_candidates, settings
                 )
                 if models2 != models:
@@ -1396,6 +1409,7 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
+                shadowed = shadowed2
                 # The gap is a difference of two scores, so the ACTIVE row
                 # must be fresh too, not just the target's (checked in the
                 # commit loop). A cached active reading can predate its own
@@ -1447,6 +1461,7 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
             )
+            ordered = _shadowed_order(ordered)
 
         if not ordered and api_key_candidates and trigger not in (
             "consume-first", "balanced"

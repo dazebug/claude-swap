@@ -7497,6 +7497,116 @@ class TestBalancedModelFallback:
                     assert h.active_number() == 1
                     assert "reclassify" in _reasons(h)
 
+    @pytest.mark.parametrize("owned", [False, True])
+    @pytest.mark.parametrize("age", [0, 600])
+    def test_an_owned_candidate_is_not_ranked(self, temp_home, owned, age):
+        from unittest.mock import patch
+
+        h = self._harness(temp_home)
+        rows = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=100, pct5=0),
+            "3": _weekly(h, 0, 84, fable=0, pct5=0),
+        }
+
+        def live_session_pids(*args, **kwargs):
+            values = [*args, *kwargs.values()]
+            return [4242] if owned and any(str(value) == "3" for value in values) else []
+
+        h.clock.advance(4000)
+        now = h.clock.now
+        entries = {num: _entry_for(value, now) for num, value in rows.items()}
+        if age:
+            entries["3"] = UsageEntry(
+                last_good=rows["3"],
+                fetched_at=now - age,
+                age_s=age,
+                last_error="timeout",
+                consecutive_failures=1,
+                backoff_until=now + 600,
+                trust_extended=True,
+            )
+
+        with patch.object(
+            h.switcher, "_live_session_pids", side_effect=live_session_pids
+        ):
+            outcome = h.tick_with_entries(entries)
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == (2 if owned else 3)
+
+    @pytest.mark.parametrize("refresh_error", ["ready", "transient", "invalid_client"])
+    def test_a_candidate_the_loop_cannot_land_on_does_not_pull_the_engine_back(
+        self, temp_home, refresh_error
+    ):
+        from contextlib import ExitStack
+        from copy import deepcopy
+        from unittest.mock import patch
+
+        from claude_swap.oauth import RefreshOutcome
+
+        h = self._harness(temp_home)
+        now = h.clock.now
+        h.seed(3, "c@example.com", expires_at=int((now + 590) * 1000))
+        rows = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=100, pct5=0),
+            "3": _weekly(h, 0, 84, fable=100, pct5=0),
+        }
+        moves = []
+
+        with ExitStack() as stack:
+            if refresh_error == "ready":
+                refresh_call = stack.enter_context(
+                    patch(
+                        "claude_swap.oauth.try_refresh_oauth_credentials",
+                        side_effect=AssertionError("refresh was not expected"),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        h.switcher,
+                        "consume_backup_grant",
+                        return_value=RefreshOutcome(
+                            h.switcher.read_account_credentials(
+                                "3", "c@example.com"
+                            ),
+                            None,
+                        ),
+                    )
+                )
+            else:
+                refresh_call = stack.enter_context(
+                    patch(
+                        "claude_swap.oauth.try_refresh_oauth_credentials",
+                        return_value=RefreshOutcome(None, refresh_error),
+                    )
+                )
+            for tick in range(8):
+                h.clock.advance(61)
+                tick_rows = deepcopy(rows)
+                if tick % 2:
+                    tick_rows["3"]["scoped"] = []
+                entries = {
+                    num: _entry_for(value, h.clock.now)
+                    for num, value in tick_rows.items()
+                }
+                before = h.active_number()
+                h.events.clear()
+                outcome = h.tick_with_entries(entries)
+                after = h.active_number()
+                if outcome is TickOutcome.SWITCHED:
+                    moves.append((before, after))
+
+        assert h.state().get("quarantine", {}) == {}
+        if refresh_error == "ready":
+            assert refresh_call.call_count == 0
+            assert moves == [(1, 3)]
+        else:
+            assert refresh_call.call_count > 0
+            assert moves[0] == (1, 2)
+            assert len(moves) <= 2
+
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         assert h.tick_with_usage({
