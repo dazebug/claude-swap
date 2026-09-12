@@ -7363,6 +7363,50 @@ class TestBalancedModelFallback:
         assert h.tick_with_usage(second) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
+    def test_a_read_failure_does_not_flip_the_bar(self, temp_home):
+        h = self._harness(temp_home)
+        view = {
+            "1": _weekly(h, 60, 84, fable=96, pct5=0),
+            "2": _weekly(h, 20, 84, fable=99, pct5=0),
+            "3": _weekly(h, 100, 84, fable=99, pct5=0),
+        }
+        moves = []
+        trace = []
+        for tick in range(6):
+            h.clock.advance(4000)
+            now = h.clock.now
+            entries = {
+                num: _entry_for(value, now) for num, value in view.items()
+            }
+            if tick % 2:
+                entries["3"] = UsageEntry(
+                    last_good=view["3"],
+                    fetched_at=now - 4000,
+                    age_s=4000,
+                    last_error="timeout",
+                    consecutive_failures=6,
+                    backoff_until=now + 600,
+                    trust_extended=False,
+                )
+            before = h.active_number()
+            h.events.clear()
+            outcome = h.tick_with_entries(entries)
+            after = h.active_number()
+            poll = next(e for e in h.events if isinstance(e, PollEvent))
+            trace.append((tick, bool(poll.model_fallback), after))
+            if outcome is TickOutcome.SWITCHED:
+                moves.append((before, after))
+
+        assert trace == [
+            (0, True, 2),
+            (1, False, 2),
+            (2, True, 2),
+            (3, False, 2),
+            (4, True, 2),
+            (5, False, 2),
+        ]
+        assert moves == [(1, 2)]
+
     def test_poll_event_marks_fallback_and_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         assert h.tick_with_usage({

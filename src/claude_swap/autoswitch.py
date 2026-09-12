@@ -1905,7 +1905,7 @@ class AutoSwitchEngine:
         effective_models = self._models if models is None else models
         left_fallback = bool(state.get("leftModelFallback"))
         now_fallback = bool(self._models) and not effective_models
-        if left_fallback != now_fallback:
+        if not left_fallback and now_fallback:
             # The departure snapshot and current headroom are comparable only
             # within one decision view. A view changes when a model window
             # resets or every tracked model window becomes spent, so the
@@ -1913,6 +1913,14 @@ class AutoSwitchEngine:
             # ranking choose the destination. The next departure records the
             # new view, so this bypass occurs at most once per view change.
             return True
+        if left_fallback and not now_fallback:
+            # A read failure can move the effective view only toward the
+            # configured set, so only this direction must distinguish it from
+            # a model-window reset. Release the bar only when the barred
+            # account itself reports a tracked model window below threshold.
+            model_pcts = _model_window_pcts(usage.get(barred), effective_models)
+            if model_pcts and max(model_pcts) < settings.threshold:
+                return True
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
         h = headroom.get(barred)
