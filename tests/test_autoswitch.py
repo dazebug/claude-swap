@@ -6976,6 +6976,40 @@ class TestBalancedStrategy:
             h.switcher._write_json(h.switcher.sequence_file, data)
         return h
 
+    def test_a_row_with_only_a_5h_window_does_not_veto_the_recovery_escape(
+        self, temp_home
+    ):
+        # A usage row with no weekly window has headroom 100, so the all-above
+        # census read it as the fleet's one healthy account and turned the
+        # recovery escape off -- while the ranking cannot place it. BLOCKED at
+        # 96% with a peer resetting in 30 minutes; the same fleet with that row
+        # unreadable moved to the peer. A row the ranking cannot choose must
+        # not count as a healthy candidate for the censuses either.
+        h = self._harness(temp_home, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 96, 84),
+            "2": _weekly(h, 97, 0.5),
+            "3": {"five_hour": {"pct": 0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _switches(h)[-1].trigger == "proactive"
+
+    def test_a_scoreless_peer_is_still_no_proactive_landing(self, temp_home):
+        # The census fix above must not admit such rows through the all-above
+        # escape instead: with nothing else to land on the tick stays blocked
+        # (and reports the readable-but-unplaceable peers as such, not as
+        # unreadable). At-limit takes them as a last resort, as before.
+        h = self._harness(temp_home, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 96, 84),
+            "2": {"five_hour": {"pct": 0}},
+            "3": {"five_hour": {"pct": 0}},
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert "no-qualifying-candidate" in _reasons(h)
+
     def test_moves_to_the_account_furthest_behind_its_weekly_pace(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({

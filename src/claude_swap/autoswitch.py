@@ -2138,6 +2138,25 @@ class AutoSwitchEngine:
         )
         active_score = scores.get(current) if balanced else None
         preferred = self._resolved_preferred_account(settings) if balanced else None
+        # Readable at all -- decides "no-comparison" vs "nothing qualified"
+        # for the caller, so it is taken over every candidate, before the
+        # universe below is narrowed.
+        any_known = any(headroom.get(n) is not None for n in oauth_candidates)
+        if balanced and trigger not in ("at-limit", "failover"):
+            # Under `balanced` an account with no weekly window has no score,
+            # and the proactive/balanced ranking cannot place it (a spend
+            # there cannot be scheduled). Then it is not a healthy CANDIDATE
+            # for the censuses below either -- one universe for the censuses
+            # and the loop. Measured: a row carrying only `five_hour`
+            # (headroom 100) read as the fleet's one healthy account, turned
+            # `all_above` off, and was then skipped as unplaceable -- BLOCKED
+            # on an active at 96% with a peer resetting in 30 minutes, while
+            # the same fleet with that row unreadable moved to the peer.
+            # At-limit and failover keep every readable row: those escapes
+            # rank a scoreless account last but do take it.
+            oauth_candidates = [
+                n for n in oauth_candidates if scores.get(n) is not None
+            ]
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -2185,12 +2204,10 @@ class AutoSwitchEngine:
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
-        any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
                 continue
-            any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
             if num == no_return:
@@ -2257,14 +2274,14 @@ class AutoSwitchEngine:
                                 fallback.append(((0, recovery_ts, -h), num))
                             continue
                 elif balanced:
-                    score = scores.get(num)
-                    if score is None:
-                        continue  # no weekly window readable: cannot be placed
+                    # Every candidate here has a score: the universe above
+                    # dropped the ones without a weekly window.
                     if trigger == "balanced":
                         # Below the threshold: move only when the active
                         # account is ahead of this one by the margin. A
                         # non-positive gap never qualifies, whatever the
                         # margin, so a zero margin cannot flip on a tie.
+                        score = scores[num]
                         gap = None if active_score is None else active_score - score
                         if gap is None or gap <= 0.0 or gap < settings.hysteresis_pct:
                             continue
