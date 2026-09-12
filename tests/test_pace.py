@@ -167,3 +167,41 @@ class TestAheadVsWillLastRelationship:
         assert result is not None
         assert result.ahead is False
         assert pace.will_last_to_reset(result) is False
+
+
+class TestDeviationPct:
+    """``deviation_pct`` — the balanced strategy's per-window score:
+    used% minus the % that on-schedule usage would be at."""
+
+    def test_on_schedule_is_zero(self):
+        # 3.5 days into the week, 50% used -> exactly on the expected line.
+        assert pace.deviation_pct(50.0, _iso(NOW + 3.5 * DAY), at=NOW) == 0.0
+
+    def test_ahead_of_pace_is_positive(self):
+        # 100h elapsed (68h to reset), 98% used: expected 59.5 -> +38.5.
+        d = pace.deviation_pct(98.0, _iso(NOW + 68 * 3600), at=NOW)
+        assert d is not None and abs(d - 38.5) < 0.05
+
+    def test_behind_pace_is_negative(self):
+        assert pace.deviation_pct(20.0, _iso(NOW + 3.5 * DAY), at=NOW) == -30.0
+
+    def test_fresh_window_is_scored_not_suppressed(self):
+        # 2h after reset, 3% used: expected 1.19 -> +1.81. compute_pace()
+        # returns None this early (SUPPRESS_AFTER_RESET_S); the score must
+        # not — a fresh window is a valid, slightly-ahead destination.
+        d = pace.deviation_pct(3.0, _iso(NOW + WEEK - 2 * 3600), at=NOW)
+        assert d is not None and abs(d - 1.81) < 0.01
+
+    def test_missing_or_unparseable_reset_counts_as_no_elapsed_time(self):
+        assert pace.deviation_pct(30.0, None, at=NOW) == 30.0
+        assert pace.deviation_pct(30.0, "not-a-date", at=NOW) == 30.0
+
+    def test_stale_reset_folds_like_compute_pace(self):
+        # resets_at two weeks + 1 day behind -> the current window started
+        # one day ago, same folding as compute_pace().
+        d = pace.deviation_pct(20.0, _iso(NOW - 2 * WEEK - DAY), at=NOW)
+        assert d is not None and abs(d - (20.0 - 100.0 / 7.0)) < 0.01
+
+    def test_non_numeric_pct_is_none(self):
+        assert pace.deviation_pct(None, _iso(NOW + DAY), at=NOW) is None
+        assert pace.deviation_pct("50", _iso(NOW + DAY), at=NOW) is None

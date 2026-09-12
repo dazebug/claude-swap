@@ -114,6 +114,37 @@ def compute_pace(
     )
 
 
+def deviation_pct(
+    pct: object,
+    resets_at: object,
+    *,
+    at: float,
+    period_s: float = WEEKLY_PERIOD_S,
+) -> float | None:
+    """``pct`` minus the percentage on-schedule usage would be at — the
+    ``balanced`` auto-switch strategy's per-window score.
+
+    Positive = ahead of pace (the window hits 100% before it resets);
+    negative = behind (quota left over at the reset). ``resets_at`` is folded
+    exactly as :func:`compute_pace` folds it, but with NO post-reset
+    suppression: a window two hours after its reset scores its small positive
+    deviation instead of dropping out of the comparison — as a destination it
+    is valid, not unknown. A missing or unparseable ``resets_at`` counts as no
+    elapsed time (expected 0, deviation == ``pct``): the window cannot be
+    placed on a schedule, and "ahead" is the conservative reading. ``None``
+    only when ``pct`` is not a number.
+    """
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    next_reset = _resets_at_ts(resets_at)
+    if next_reset is None:
+        return float(pct)
+    remaining = (next_reset - at) % period_s
+    elapsed = 0.0 if remaining == 0 else period_s - remaining
+    expected_pct = min(100.0, (elapsed / period_s) * 100.0)
+    return float(pct) - expected_pct
+
+
 def projected_exhaustion_ts(pace: PaceResult, *, fetched_at: float) -> float | None:
     """Linear-projection ETA (POSIX timestamp) for when usage would hit 100%.
 

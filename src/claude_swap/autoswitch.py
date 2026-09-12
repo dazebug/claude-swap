@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, pace, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -314,6 +314,13 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # account number → weekly pace deviation in pct points (used − expected;
+    # positive = ahead of schedule). Emitted by ``strategy: balanced`` only,
+    # since that is the number its decisions are made on. Additive field.
+    pace: dict[str, float | None] = field(default_factory=dict)
+    # The configured model names this tick set aside; empty when the tick was
+    # decided on the configured windows.
+    model_fallback: tuple[str, ...] = ()
 
     def _fields(self) -> dict:
         fields = {
@@ -325,15 +332,33 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.pace:
+            fields["paceDeviationPct"] = self.pace
+        if self.model_fallback:
+            fields["modelFallback"] = True
         return fields
+
+    def _model_fallback_tag(self) -> str:
+        if not self.model_fallback:
+            return ""
+        models = ", ".join(self.model_fallback)
+        return (
+            f" · model-limit fallback ({models}: no account to land on; "
+            "deciding on 5h/7d)"
+        )
+
+    def _pace_tag(self, num: str) -> str:
+        d = self.pace.get(num)
+        return f" · pace {d:+.1f}" if d is not None else ""
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            joined = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            return joined + self._pace_tag(num)
         h = self.headroom.get(num)
         if h is not None:
-            return f"{100 - h:.0f}%"
+            return f"{100 - h:.0f}%" + self._pace_tag(num)
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
@@ -343,7 +368,7 @@ class PollEvent(AutoSwitchEvent):
         num = self.active.get("number")
         h = self.headroom.get(str(num))
         if h is not None:
-            used = f"{100 - h:.0f}% used"
+            used = f"{100 - h:.0f}% used{self._pace_tag(str(num))}"
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -355,14 +380,15 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"(switch at {pct_label(self.threshold)}%){self._model_fallback_tag()}"
+            f"{tail}"
         )
 
 
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "balanced"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -614,8 +640,24 @@ def _every_account_above_threshold(
     return all((100.0 - h) >= threshold for h in measured)
 
 
+def _landable(headroom: float | None, threshold: float) -> bool:
+    return headroom is not None and (100.0 - headroom) < threshold
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
+
+
+def _model_window_pcts(
+    usage_value: dict | None, models: tuple[str, ...]
+) -> list[float]:
+    if not isinstance(usage_value, dict):
+        return []
+    return [
+        pct
+        for label, pct, _ in oauth.relevant_windows(usage_value, models)
+        if label not in ("5h", "7d")
+    ]
 
 
 def _headroom_by_account(
@@ -628,6 +670,28 @@ def _headroom_by_account(
         )
         for num, value in usage.items()
     }
+
+
+def _pace_deviation(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float | None:
+    """The ``balanced`` strategy's raw score for one account: how far its
+    weekly windows are ahead of their own schedule, in percentage points.
+
+    ``max`` over the 7d window and every tracked per-model window of
+    ``used% − expected%`` (:func:`pace.deviation_pct`): model work debits
+    both, and the window further ahead is the one that binds first. The 5h
+    window is excluded — it recycles too fast to schedule around — but still
+    gates eligibility through ``account_headroom``. None when no weekly
+    window is readable: unknown, never "on schedule".
+    """
+    scores = [
+        d
+        for label, pct, resets_at in oauth.relevant_windows(usage, models)
+        if label != "5h"
+        and (d := pace.deviation_pct(pct, resets_at, at=now)) is not None
+    ]
+    return max(scores) if scores else None
 
 
 class AutoSwitchEngine:
@@ -684,6 +748,73 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+
+    def _decision_models(
+        self,
+        usage: dict[str, dict | str | None],
+        current: str,
+        oauth_candidates: list[str],
+        settings: AutoSwitchSettings,
+    ) -> tuple[tuple[str, ...], bool]:
+        """Choose the configured or 5h/7d view from landability.
+
+        The configured view is eligible for fallback only when the active
+        account reports a tracked model window at or over the threshold. A
+        readable OAuth candidate that the ranking could land on in the
+        configured view -- landable there AND carrying a weekly window to be
+        placed on a schedule, the same two conditions `_rank_candidates`
+        applies to a proactive/balanced landing -- keeps that view and marks
+        it as shadowed; the caller then limits escape targets to those
+        configured-view landings. If no such configured candidate exists, the
+        active account that can be landed on in 5h/7d, or a readable candidate
+        the ranking could land on in 5h/7d, selects ``()``; otherwise the
+        configured tuple remains. The candidate census excludes accounts the
+        commit loop skips, so they cannot decide the view or its ranking.
+        Unreadable candidates, candidates that cannot be landed on in 5h/7d,
+        candidates with no weekly window (a row carrying only ``five_hour``
+        has headroom 100 in every view and can be landed on in none of them),
+        and membership changes for an unusable account are excluded: otherwise
+        the view and the ranking can make opposite decisions about the same
+        row, and the tick ends blocked on a view that had somewhere to go. An
+        unreadable active, or an active without a tracked model window, keeps
+        the configured view so failover and an active that can continue model
+        work are unchanged. Called on the stored snapshot and again on the
+        phase-2 refetch; the caller defers when the answers differ.
+        """
+        if not self._models:
+            return self._models, False
+        active = usage.get(current)
+        if not isinstance(active, dict):
+            return self._models, False
+        active_model_pcts = _model_window_pcts(active, self._models)
+        if not active_model_pcts or max(active_model_pcts) < settings.threshold:
+            return self._models, False
+
+        readable_candidates = [
+            value
+            for num in oauth_candidates
+            if isinstance(value := usage.get(num), dict)
+        ]
+        now = self.clock()
+
+        def placeable(value: dict, models: tuple[str, ...]) -> bool:
+            # What the ranking accepts as a proactive/balanced landing in this
+            # view: below the threshold, with a weekly window to score it on
+            # (`_rank_candidates` skips a candidate whose score is None).
+            return (
+                _landable(oauth.account_headroom(value, models), settings.threshold)
+                and _pace_deviation(value, models, now) is not None
+            )
+
+        if any(placeable(value, self._models) for value in readable_candidates):
+            return self._models, True
+
+        active_headroom = oauth.account_headroom(active, ())
+        if _landable(active_headroom, settings.threshold):
+            return (), False
+        if any(placeable(value, ()) for value in readable_candidates):
+            return (), False
+        return self._models, False
 
     # -- state file ---------------------------------------------------------
 
@@ -766,6 +897,13 @@ class AutoSwitchEngine:
 
     # -- freshening -----------------------------------------------------------
 
+    def _owned_by_live_session(self, number: str) -> bool:
+        return bool(
+            self.switcher.live_session_pids_for(
+                number, self.switcher.account_email(number)
+            )
+        )
+
     def _freshen_target(self, number: str, email: str) -> str:
         """Ensure a candidate's stored token outlives Claude Code's 5-min
         refresh buffer before it gets activated.
@@ -779,7 +917,7 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(number, email):
+        if self._owned_by_live_session(number):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
             # one rotating refresh token in two config dirs (the stale-copy
@@ -894,6 +1032,7 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        balanced = settings.strategy == "balanced"
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -934,14 +1073,57 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        # -- candidate census -------------------------------------------
+        # The no-return bar is not applied here: it is a statement about the
+        # CHOICE, so it lives in `_rank` where the choice is made. See
+        # `_no_return_account` for the incident, the scoping, and the release.
+        candidates = [
+            num
+            for num in self.switcher.switchable_account_numbers()
+            if num != current and num not in quarantined
+        ]
+        oauth_candidates = [
+            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+        ]
+        if balanced:
+            oauth_candidates = [
+                n for n in oauth_candidates if not self._owned_by_live_session(n)
+            ]
+        api_key_candidates = (
+            [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
+            if settings.include_api_key_accounts
+            else []
+        )
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+
+        # balanced: when no configured-view landing remains, this tick can be
+        # decided on 5h/7d alone (see `_decision_models`). The poll reports it;
+        # collection and the scheduler keep the configured set.
+        models, shadowed = (
+            self._decision_models(usage, current, oauth_candidates, settings)
+            if balanced
+            else (self._models, False)
+        )
+        if models != self._models:
+            headroom = _headroom_by_account(usage, models)
+
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                pace=(
+                    {
+                        num: _pace_deviation(value, models, self.clock())
+                        for num, value in usage.items()
+                        if isinstance(value, dict)
+                    }
+                    if balanced
+                    else {}
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -954,6 +1136,7 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                model_fallback=self._models if models != self._models else (),
             )
         )
 
@@ -978,7 +1161,7 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                if settings.strategy not in ("consume-first", "balanced"):
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -991,11 +1174,19 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                if balanced:
+                    # balanced: below the threshold we still move, to whichever
+                    # account is furthest behind its own weekly schedule -- but
+                    # only once the active account is ahead of it by the
+                    # hysteresis margin. `_rank_candidates` applies both.
+                    trigger = "balanced"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account with
+                    # room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1046,30 +1237,16 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if (
+            trigger in ("proactive", "consume-first", "balanced")
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        candidates = [
-            num
-            for num in self.switcher.switchable_account_numbers()
-            if num != current and num not in quarantined
-        ]
-        oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
-        ]
-        # The no-return bar itself lives in `_rank` below: it is a statement
-        # about the CHOICE, so it belongs where the choice is made rather than
-        # in this census of what exists. See `_no_return_account` for the
-        # incident, the scoping, and the release.
-        api_key_candidates = (
-            [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
-            if settings.include_api_key_accounts
-            else []
-        )
         if (
-            trigger == "consume-first"
+            trigger in ("consume-first", "balanced")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1173,11 +1350,31 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        def _shadowed_order(ordered: list[str]) -> list[str]:
+            # With the configured view shadowed (see `_decision_models`), an
+            # escape lands only where that view can land: at-limit and
+            # failover skip the landing gate, and a spent model window would
+            # re-trigger on the next tick.
+            if not shadowed or trigger not in (
+                "at-limit", "failover", "proactive"
+            ):
+                return ordered
+            return [
+                num
+                for num in ordered
+                if isinstance(value := usage.get(num), dict)
+                and _landable(
+                    oauth.account_headroom(value, self._models),
+                    settings.threshold,
+                )
+            ]
+
         decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
+            models=models,
             usage=usage,
             headroom=headroom,
             current=current,
@@ -1185,8 +1382,9 @@ class AutoSwitchEngine:
             settings=settings,
             now=decided_now,
         )
+        ordered = _shadowed_order(ordered)
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "balanced") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1202,13 +1400,73 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
-            headroom = _headroom_by_account(usage, self._models)
+            headroom = _headroom_by_account(usage, models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
+            if trigger == "balanced":
+                models2, shadowed2 = self._decision_models(
+                    usage, current, oauth_candidates, settings
+                )
+                if models2 != models:
+                    # The set of accounts we can safely rank on changed
+                    # between the provisional and phase-2 rows. The right
+                    # state move is to decide again next tick under a single,
+                    # stable frame.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reclassify",
+                            detail=(
+                                "fresh usage changes whether the model windows "
+                                "are spent on every account; deciding next tick"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                shadowed = shadowed2
+                # The gap is a difference of two scores, so the ACTIVE row
+                # must be fresh too, not just the target's (checked in the
+                # commit loop). A cached active reading can predate its own
+                # weekly reset: 80% in the store, 0% in truth, and the whole
+                # "gap" is that stale number.
+                active_entry = entries.get(current)
+                if active_entry is None or not active_entry.fresh(self.clock()):
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="stale-usage",
+                            detail=(
+                                f"account {current} (active) usage could not "
+                                "be refreshed this tick; retrying"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                if (
+                    active_headroom is None
+                    or (100.0 - active_headroom) >= settings.threshold
+                ):
+                    # Classified as a below-threshold balancing move on the
+                    # stored snapshot, but the fresh active is at/over the
+                    # threshold (or unreadable). That is the proactive /
+                    # at-limit / all-above regime, which has its own landing
+                    # gates and the no-return bar -- and `balanced` carries
+                    # none of them. Decide it next tick under the right
+                    # trigger instead of switching under this one.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reclassify",
+                            detail=(
+                                "fresh usage puts the active account at or "
+                                "over the threshold, or leaves it unreadable; "
+                                "deciding next tick under the threshold gates"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
+                models=models,
                 usage=usage,
                 headroom=headroom,
                 current=current,
@@ -1216,8 +1474,11 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
             )
+            ordered = _shadowed_order(ordered)
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger not in (
+            "consume-first", "balanced"
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
@@ -1234,6 +1495,31 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "balanced":
+                # Below the threshold and healthy: staying put is the normal
+                # outcome. Say where everyone stands so the strategy can be
+                # seen working (or holding) from the log alone.
+                scores = self._balanced_scores(
+                    usage, settings, models, decided_now
+                )
+                standing = ", ".join(
+                    f"#{num} " + ("?" if d is None else f"{d:+.1f}")
+                    for num, d in sorted(
+                        scores.items(), key=lambda kv: int(kv[0])
+                    )
+                    if num == current or num in oauth_candidates
+                )
+                self._emit(
+                    NoSwitchEvent(
+                        reason="balanced-hold",
+                        detail=(
+                            "no healthy account is behind the active one's "
+                            f"weekly pace by >= {pct_label(settings.hysteresis_pct)} "
+                            f"pp (pace: {standing})"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1307,13 +1593,13 @@ class AutoSwitchEngine:
         # consume-first that is the phase-2 refetch, not the stale one.
         left_snapshot = (
             active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, decided_now),
+            _binding_recovery_ts(usage.get(current), models, decided_now),
         )
         transient_failure = False
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "balanced"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1335,7 +1621,13 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(
+                    num,
+                    email,
+                    trigger,
+                    left_snapshot,
+                    left_model_fallback=models != self._models,
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1366,7 +1658,13 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(
+                num,
+                email,
+                trigger,
+                left_snapshot,
+                left_model_fallback=models != self._models,
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -1380,6 +1678,44 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _resolved_preferred_account(
+        self, settings: AutoSwitchSettings
+    ) -> str | None:
+        """``autoswitch.preferredAccount`` as an account number, or None if
+        unset, unresolvable or ambiguous (e.g. two slots sharing an email:
+        never guess which slot the user meant)."""
+        if not settings.preferred_account:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(
+                settings.preferred_account
+            )
+        except ClaudeSwitchError:
+            return None
+
+    def _balanced_scores(
+        self,
+        usage: dict[str, dict | str | None],
+        settings: AutoSwitchSettings,
+        models: tuple[str, ...],
+        now: float,
+    ) -> dict[str, float | None]:
+        """Adjusted pace score per account for ``strategy: balanced``.
+
+        The raw deviation (`_pace_deviation`), minus ``preference_pct`` for
+        the preferred account: it wins near-ties and keeps the work until it
+        is ahead of its schedule by more than the bias plus the hysteresis
+        margin. Lower is the better place to be. None = unknown.
+        """
+        preferred = self._resolved_preferred_account(settings)
+        scores: dict[str, float | None] = {}
+        for num, value in usage.items():
+            d = _pace_deviation(value, models, now)
+            if d is not None and num == preferred:
+                d -= settings.preference_pct
+            scores[num] = d
+        return scores
 
     def _no_return_account(
         self,
@@ -1403,7 +1739,9 @@ class AutoSwitchEngine:
 
         SCOPED like every sibling gate — `at-limit` and `failover` skip the
         anti-flap gates by design. Unscoped this stranded a 2-account fleet on
-        an exhausted active with the peer at 0%.
+        an exhausted active with the peer at 0%. Under ``balanced`` it covers
+        only an account that cannot be landed on in the current view — see
+        the check below.
 
         AND SCOPED TO THE ENGINE'S OWN LANDING (`lastSwitchTo == current`).
         The bar refuses to undo THIS ENGINE'S last move; once the user
@@ -1484,6 +1822,17 @@ class AutoSwitchEngine:
         # account that is not in it bars nothing. The check was a no-op and
         # nothing killed it under mutation.
         barred = str(came_from)
+        # Under `balanced` an account that can be landed on in this tick's
+        # view is never barred. It was over the threshold in this same view
+        # when the engine left it, so the landing gate in `_rank_candidates`
+        # refuses it until it genuinely recovers, and between two healthy
+        # accounts the pace hysteresis bounds the move rate. The bar stays for
+        # the all-above escape, which lands over the threshold on purpose.
+        if (
+            settings.strategy == "balanced"
+            and _landable(headroom.get(barred), settings.threshold)
+        ):
+            return None
         if not recovered:
             return barred        # the ratio below burns true on its own; see above
         left_headroom = headroom.get(barred)
@@ -1671,8 +2020,12 @@ class AutoSwitchEngine:
             # dominance leg has, guarded directly in the mutation table.
             if h is not None and h > 100.0 - settings.threshold:
                 return True
-            peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
-            active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
+            peer_recovery_ts = _binding_recovery_ts(
+                usage.get(barred), self._models, now
+            )
+            active_recovery_ts = _binding_recovery_ts(
+                usage.get(current), self._models, now
+            )
             # The active's recovery must be a REAL measurement, not merely
             # "larger" -- `_binding_recovery_ts` returns `inf` for both
             # "never resets" and "we do not know" (no windows, no
@@ -1746,9 +2099,15 @@ class AutoSwitchEngine:
         # `None` is the JSON-safe spelling of "unknown or already past", which
         # `_binding_recovery_ts` returns as `inf`: an account nobody can
         # schedule around. Moving off it onto a real reset IS the improvement.
-        was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
+        was = (
+            left_recovery
+            if isinstance(left_recovery, (int, float))
+            else float("inf")
+        )
         return (
-            _binding_recovery_ts(usage.get(barred), self._models, now)
+            _binding_recovery_ts(
+                usage.get(barred), self._models, now
+            )
             < was - RECOVERY_HYSTERESIS_S
         )
 
@@ -1765,6 +2124,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        models: tuple[str, ...] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1773,11 +2133,39 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
+        if models is None:
+            models = self._models
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # balanced ranks by adjusted pace score (lower = further behind its
+        # own weekly schedule = the better place to send work). Scored from
+        # THIS snapshot, so the phase-2 re-rank sees fresh numbers.
+        balanced = settings.strategy == "balanced"
+        scores = (
+            self._balanced_scores(usage, settings, models, now) if balanced else {}
+        )
+        active_score = scores.get(current) if balanced else None
+        preferred = self._resolved_preferred_account(settings) if balanced else None
+        # Readable at all -- decides "no-comparison" vs "nothing qualified"
+        # for the caller, so it is taken over every candidate, before the
+        # universe below is narrowed.
+        any_known = any(headroom.get(n) is not None for n in oauth_candidates)
+        if balanced and trigger not in ("at-limit", "failover"):
+            # Under `balanced` an account with no weekly window has no score,
+            # and the proactive/balanced ranking cannot place it. Then it is
+            # not a healthy candidate for the censuses below either -- one
+            # universe for the censuses and the loop. Counted, a row carrying
+            # only `five_hour` (headroom 100) turned `all_above` off as the
+            # fleet's one healthy account and was then skipped as unplaceable:
+            # blocked at 96% with a peer resetting in 30 minutes. At-limit and
+            # failover keep every readable row -- those escapes rank a
+            # scoreless account last but do take it.
+            oauth_candidates = [
+                n for n in oauth_candidates if scores.get(n) is not None
+            ]
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -1818,19 +2206,17 @@ class AutoSwitchEngine:
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
+            _binding_recovery_ts(usage.get(current), models, now)
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
-        any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
                 continue
-            any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
             if num == no_return:
@@ -1839,16 +2225,16 @@ class AutoSwitchEngine:
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(usage.get(num), models, now)
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "balanced"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if not _landable(h, settings.threshold) and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -1896,6 +2282,21 @@ class AutoSwitchEngine:
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
                             continue
+                elif balanced:
+                    # Every candidate here has a score: the universe above
+                    # dropped the ones without a weekly window.
+                    if trigger == "balanced":
+                        # Below the threshold: move only when the active
+                        # account is ahead of this one by the margin. A
+                        # non-positive gap never qualifies, whatever the
+                        # margin, so a zero margin cannot flip on a tie.
+                        score = scores[num]
+                        gap = None if active_score is None else active_score - score
+                        if gap is None or gap <= 0.0 or gap < settings.hysteresis_pct:
+                            continue
+                    # At/over the threshold (proactive): any healthy account
+                    # beats the one we are leaving; the sort below still
+                    # sends us to the one furthest behind its schedule.
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
@@ -1913,7 +2314,7 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if all_above and trigger in ("proactive", "consume-first", "balanced"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -1937,6 +2338,21 @@ class AutoSwitchEngine:
                 # sooner is plainly better than lower slot number.
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                )
+            elif balanced:
+                # Healthy landings first -- the at-limit and failover
+                # escapes skip the landing gate above, and a spent 5h window
+                # with the best pace score would only re-trigger next tick.
+                # Then furthest behind its weekly schedule (unknown sorts
+                # last), the preferred account breaks ties, then sequence
+                # order. Every trigger ranks on this axis under `balanced`:
+                # an at-limit escape lands on the account with the most
+                # schedule left, not the one with the most raw headroom.
+                score = scores.get(num)
+                key = (
+                    0 if (100.0 - h) < settings.threshold else 1,
+                    score if score is not None else float("inf"),
+                    0 if num == preferred else 1,
                 )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
@@ -2102,6 +2518,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        left_model_fallback: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2124,7 +2541,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first", "balanced")
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2149,7 +2569,10 @@ class AutoSwitchEngine:
             # learn about it.
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
             state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+            state["leftRecoveryAt"] = (
+                None if recovery == float("inf") else recovery
+            )
+            state["leftModelFallback"] = left_model_fallback
             # A `consume-first` phase-2 refetch can write the SAME (None,
             # None) shape a `failover` departure writes, whenever the
             # refetched active row has a `pct` but is otherwise unmeasurable

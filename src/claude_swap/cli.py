@@ -654,6 +654,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--preferred-account",
+        metavar="ACCOUNT",
+        help=(
+            "With --strategy balanced: favour this account (alias, slot number, "
+            "or email) by autoswitch.preferencePct points of pace, so it keeps "
+            "the work on near-ties without ever being run far ahead of its "
+            "own schedule"
+        ),
+    )
+    parser.add_argument(
         "--include-api-key-accounts",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -664,12 +674,15 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "balanced"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest) or 'balanced' (keep every account's weekly "
+            "windows on their own schedule: move to the account furthest "
+            "behind its pace once the active one is ahead by the hysteresis "
+            "margin)"
         ),
     )
     parser.add_argument(

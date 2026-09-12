@@ -91,6 +91,7 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
+cswap auto --strategy balanced --model Fable   # keep every account's weekly windows on schedule
 ```
 
 <details>
@@ -99,6 +100,9 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- **`balanced`** (`--strategy balanced`) keeps every account's **weekly windows on their own schedule**, so the fleet's quota is actually used instead of one account running dry days early while another's expires unused. Each account is scored by the highest `used% − expected%` across its 7d and `--model` windows, where `expected%` is the share of that window's week already elapsed. Below the threshold it moves to the lowest-scoring healthy account once the active one is ahead by `hysteresisPct` points (15 works well); at or above the threshold it moves without waiting for that margin. The cooldown sets the minimum time between moves, and every poll logs each account's pace deviation.
+  - Set `preferredAccount` (alias, slot number, or email) to subtract `preferencePct` (default 10) from its score: it wins near-ties and keeps the work until it is further ahead of its schedule than the alternatives by more than the bias — a bounded preference for, say, billing the company account, not a spend order.
+  - With `--model`, when the model limits leave no account to switch to but the 5h/7d windows still have room, balancing runs on 5h/7d alone (`modelFallback` in the poll) until an account with model room can be switched to again.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -274,6 +278,8 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.strategy balanced  # keep weekly windows on schedule (see "auto")
+cswap config set autoswitch.preferredAccount work  # balanced: favour this one by preferencePct
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
