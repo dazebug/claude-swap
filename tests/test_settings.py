@@ -355,3 +355,47 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestBalancedStrategySettings:
+    def test_balanced_is_a_valid_strategy(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "balanced")
+        assert load_settings(tmp_path).strategy == "balanced"
+
+    def test_preferred_account_and_preference_pct_round_trip(self, tmp_path: Path):
+        assert AutoSwitchSettings().preferred_account is None
+        assert AutoSwitchSettings().preference_pct == 10.0
+        set_setting(tmp_path, "autoswitch.preferredAccount", "watcha")
+        set_setting(tmp_path, "autoswitch.preferencePct", "25")
+        loaded = load_settings(tmp_path)
+        assert loaded.preferred_account == "watcha"
+        assert loaded.preference_pct == 25.0
+
+    def test_preference_pct_out_of_range_is_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between"):
+            set_setting(tmp_path, "autoswitch.preferencePct", "150")
+
+    def test_preferred_account_cli_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(preferred_account="work"),
+            _args(preferred_account="personal"),
+        )
+        assert merged.preferred_account == "personal"
+
+    def test_non_finite_numbers_fall_back_to_defaults(self, tmp_path: Path):
+        # Python's json loader accepts NaN/Infinity; a NaN margin makes every
+        # comparison false and the engine ping-pongs on fixed inputs.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"preferencePct": NaN, "threshold": Infinity}}'
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.preference_pct == 10.0
+        assert loaded.threshold == AutoSwitchSettings().threshold
+
+    def test_huge_integer_clamps_instead_of_overflowing(self, tmp_path: Path):
+        # json.load yields an arbitrary-precision int; math.isfinite() raises
+        # OverflowError on it. Clamp it like any other out-of-range number.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"preferencePct": 1' + "0" * 400 + "}}"
+        )
+        assert load_settings(tmp_path).preference_pct == 100.0

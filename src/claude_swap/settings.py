@@ -12,6 +12,7 @@ warning, never a crash — so a bad hand edit degrades to default behavior.
 from __future__ import annotations
 
 import dataclasses
+import math
 import json
 import logging
 import os
@@ -47,7 +48,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset) or
+    # "balanced" (keep every account's weekly windows on their own schedule).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +60,13 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # ``balanced`` only. Account identifier (alias, slot number, or email)
+    # whose pace score is lowered by ``preference_pct``, so it wins near-ties
+    # and keeps the work until it is meaningfully further ahead of its own
+    # schedule than an alternative. A bounded preference, not a spend order.
+    preferred_account: str | None = None
+    # Size of that bias, in percentage points of pace deviation.
+    preference_pct: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -120,7 +130,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "balanced"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -134,6 +144,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "preferredAccount", "preferred_account", "string",
+            help="balanced: favour this account by preferencePct points of pace",
+        ),
+        SettingSpec(
+            "autoswitch", "preferencePct", "preference_pct", "float", 0.0, 100.0,
+            help="balanced: pace points forgiven to the preferred account",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -172,6 +190,12 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        if isinstance(value, float) and not math.isfinite(value):
+            # json.load accepts NaN/Infinity. A NaN margin makes every gap
+            # comparison false and the engine ping-pongs on fixed inputs.
+            # Floats only: an arbitrary-precision JSON int overflows
+            # isfinite(), and the clamp below handles it exactly.
             return default
         return float(min(max(value, lo), hi))
 
@@ -431,6 +455,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("preferred_account", "preferred_account"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
