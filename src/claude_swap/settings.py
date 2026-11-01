@@ -26,7 +26,8 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first")
+# "balanced" keeps every account's weekly windows on their own schedule.
+AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first", "balanced")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -69,6 +70,13 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # ``balanced`` only. Account identifier (alias, slot number, or email)
+    # whose pace score is lowered by ``preference_pct``, so it wins near-ties
+    # and keeps the work until it is meaningfully further ahead of its own
+    # schedule than an alternative. A bounded preference, not a spend order.
+    preferred_account: str | None = None
+    # Size of that bias, in percentage points of pace deviation.
+    preference_pct: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -171,6 +179,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "preferredAccount", "preferred_account", "string",
+            help="balanced: favour this account by preferencePct points of pace",
+        ),
+        SettingSpec(
+            "autoswitch", "preferencePct", "preference_pct", "float", 0.0, 100.0,
+            help="balanced: pace points forgiven to the preferred account",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -521,6 +537,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("preferred_account", "preferred_account"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
