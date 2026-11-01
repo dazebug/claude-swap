@@ -8065,3 +8065,59 @@ class TestBalancedModelFallback:
         assert "modelFallback" not in (
             next(e for e in h.events if isinstance(e, PollEvent)).to_json()
         )
+
+    def test_a_model_window_under_the_weekly_line_keeps_the_configured_view(
+        self, temp_home
+    ):
+        # The model gate reads each window's own line: with weeklyThreshold 97
+        # a Fable window at 95% is not spent, so the tick stays on the
+        # configured view, where both peers are over their weekly lines. Read
+        # against the 5h threshold (90) it counted as spent, and the tick fell
+        # back to 7d and moved to #2.
+        h = self._harness(temp_home, weekly_threshold=97.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=95),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_a_model_window_under_the_accounts_own_line_keeps_the_configured_view(
+        self, temp_home
+    ):
+        # The same with a per-account line: the active account switches at 96,
+        # so its Fable window at 93% is not spent.
+        h = self._harness(temp_home)
+        h.switcher.set_account_threshold("1", 96.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=93),
+            "2": _weekly(h, 20, 84, fable=97),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
+
+    def test_a_peer_under_its_own_model_line_is_a_configured_view_landing(
+        self, temp_home
+    ):
+        # #2 switches at 98, so its Fable window at 96% can still be landed
+        # on: the configured view has a landing and the tick moves there
+        # without falling back. Read against the global 90 it counted as
+        # spent, and the move came from the 7d view as a `balanced` one.
+        h = self._harness(temp_home)
+        h.switcher.set_account_threshold("2", 98.0)
+        outcome = h.tick_with_usage({
+            "1": _weekly(h, 60, 84, fable=96),
+            "2": _weekly(h, 20, 84, fable=96),
+            "3": _weekly(h, 45, 84, fable=99),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _switches(h)[-1].trigger == "proactive"
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "modelFallback" not in poll.to_json()
